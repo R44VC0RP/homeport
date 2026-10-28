@@ -197,6 +197,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         log.notice("prefetching \(ids.count) small files \(kind, privacy: .public) \(opened ?? dirId, privacy: .public)")
         let asked = Date()
         requestDownloads(ids)
+        trailingKick(attempt: 0)
         // The cache only knows downloads it recorded; files downloaded
         // before that (or evicted) can look undownloaded and produce no
         // fetch. If no fetch has started shortly after, try files from
@@ -211,6 +212,25 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             let more = self.smallFiles(in: nil, excluding: opened, budget: 256 << 10, limit: 2)
             log.notice("no fetch after prefetching \(kind, privacy: .public) \(opened ?? dirId, privacy: .public); \(more.count) more from anywhere")
             self.requestDownloads(more)
+        }
+    }
+
+    /// A reader can open one of the files this prefetch is fetching
+    /// (Finder clicks right after a listing). That open waits on the
+    /// prefetch's materialization, and with no fetch after it gets the
+    /// whole hold (airbook: 685 ms, opened 3 ms after its prefetch fetch).
+    /// So once the batch's fetches have gone quiet, one more small fetch.
+    private func trailingKick(attempt: Int) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let busy = self.lastFetchStart.map { Date().timeIntervalSince($0) < 0.1 } ?? false
+            self.lock.unlock()
+            if busy && attempt < 4 {
+                self.trailingKick(attempt: attempt + 1)
+                return
+            }
+            self.requestDownloads(self.smallFiles(in: nil, excluding: nil, budget: 64 << 10, limit: 1))
         }
     }
 
