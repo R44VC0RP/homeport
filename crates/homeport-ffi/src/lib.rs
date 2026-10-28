@@ -651,6 +651,21 @@ impl Core {
         Ok(c.listed_items(offset, limit)?.into_iter().map(Into::into).collect())
     }
 
+    /// Records a completed download of `id` at `content_rev`.
+    pub fn note_fetched(&self, id: String, content_rev: u64) -> Result<()> {
+        if let Some(c) = self.shared.cache() {
+            c.note_fetched(&id, content_rev)?;
+        }
+        Ok(())
+    }
+
+    /// Small files never downloaded at their current content: in `dir_id`
+    /// smallest first, or (`None`) anywhere in the cache in random order.
+    pub fn small_unfetched_files(&self, dir_id: Option<String>, max_size: u64, limit: u32) -> Result<Vec<FfiItem>> {
+        let Some(c) = self.shared.cache() else { return Ok(Vec::new()) };
+        Ok(c.small_unfetched(dir_id.as_deref(), max_size, limit)?.into_iter().map(Into::into).collect())
+    }
+
     pub fn cached_item(&self, id: String) -> Result<Option<FfiItem>> {
         let Some(c) = self.shared.cache() else { return Ok(None) };
         Ok(c.item(&id)?.map(Into::into))

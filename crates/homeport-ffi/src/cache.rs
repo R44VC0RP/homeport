@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS dirs (
     dir_rev INTEGER NOT NULL,
     total INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fetched (
+    id TEXT PRIMARY KEY,
+    content_rev INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -130,7 +134,7 @@ impl Cache {
     }
 
     pub fn clear(&self) -> rusqlite::Result<()> {
-        self.db.execute_batch("DELETE FROM items; DELETE FROM dirs; DELETE FROM meta;")
+        self.db.execute_batch("DELETE FROM items; DELETE FROM dirs; DELETE FROM meta; DELETE FROM fetched;")
     }
 
     /// `(dir_rev, total)` of a cached listing (`total` as of its last full
@@ -157,6 +161,36 @@ impl Cache {
             .db
             .prepare_cached(&format!("SELECT {COLS} FROM items WHERE parent_id = ?1 ORDER BY name LIMIT ?2 OFFSET ?3"))?;
         st.query_map(params![dir, limit, offset], row_to_item)?.collect()
+    }
+
+    /// Records that a file's content (at `content_rev`) was downloaded.
+    pub fn note_fetched(&self, id: &str, content_rev: u64) -> rusqlite::Result<()> {
+        self.db
+            .prepare_cached("INSERT OR REPLACE INTO fetched (id, content_rev) VALUES (?1, ?2)")?
+            .execute(params![id, content_rev as i64])?;
+        Ok(())
+    }
+
+    /// Small visible files whose current content was never downloaded: in
+    /// `dir` smallest first, or (`None`) anywhere in random order.
+    pub fn small_unfetched(&self, dir: Option<&str>, max_size: u64, limit: u32) -> rusqlite::Result<Vec<CachedItem>> {
+        let cols = COLS.split(", ").map(|c| format!("i.{c}")).collect::<Vec<_>>().join(", ");
+        let filter = "i.kind = 0 AND i.size > 0 AND i.size < ?1 AND substr(i.name, 1, 1) != '.' \
+            AND NOT EXISTS (SELECT 1 FROM fetched f WHERE f.id = i.id AND f.content_rev = i.content_rev)";
+        match dir {
+            Some(d) => {
+                let mut st = self.db.prepare_cached(&format!(
+                    "SELECT {cols} FROM items i WHERE i.parent_id = ?3 AND {filter} ORDER BY i.size LIMIT ?2"
+                ))?;
+                st.query_map(params![max_size as i64, limit, d], row_to_item)?.collect()
+            }
+            None => {
+                let mut st = self
+                    .db
+                    .prepare_cached(&format!("SELECT {cols} FROM items i WHERE {filter} ORDER BY random() LIMIT ?2"))?;
+                st.query_map(params![max_size as i64, limit], row_to_item)?.collect()
+            }
+        }
     }
 
     /// Every item in a cached directory (for the working set).

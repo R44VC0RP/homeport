@@ -178,20 +178,27 @@ def run_deepls(n):
     """First visits of dataless folders below the crawl's depth (or anywhere
     the crawl skipped), found by walking materialized folders."""
     dev = os.path.join(ROOT, "dev")
-    found, seen = [], 0
-    stack = [os.path.join(dev, d) for d in os.listdir(dev) if not d.startswith(".")]
-    random.shuffle(stack)
-    while stack and len(found) < n * 3 and seen < 20000:
-        p = stack.pop()
-        seen += 1
-        if os.path.islink(p) or not os.path.isdir(p):
-            continue
-        if dataless(p):
-            found.append(p)
-            continue
-        kids = [os.path.join(p, c) for c in os.listdir(p) if not c.startswith(".") and c not in SKIP]
-        random.shuffle(kids)
-        stack.extend(kids)
+    repos = [os.path.join(dev, d) for d in os.listdir(dev) if not d.startswith(".")]
+    random.shuffle(repos)
+    found = []
+    for repo in repos:
+        if len(found) >= n:
+            break
+        # At most two per repo, so the sample spans repos.
+        stack, mine, seen = [repo], [], 0
+        while stack and len(mine) < 2 and seen < 400:
+            p = stack.pop()
+            seen += 1
+            if os.path.islink(p) or not os.path.isdir(p):
+                continue
+            if dataless(p):
+                if p != repo:
+                    mine.append(p)
+                continue
+            kids = [os.path.join(p, c) for c in os.listdir(p) if not c.startswith(".") and c not in SKIP]
+            random.shuffle(kids)
+            stack.extend(kids)
+        found += mine
     random.shuffle(found)
     ts = []
     for p in found[:n]:

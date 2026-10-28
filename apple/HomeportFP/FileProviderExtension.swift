@@ -183,7 +183,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 ids += smallFiles(in: dir.parentId, excluding: nil, budget: 256 << 10, limit: want - ids.count)
             }
         }
-        guard !ids.isEmpty else { return }
+        if ids.isEmpty {
+            // Nothing undownloaded nearby (or a folder without files): any
+            // one real fetch ends the hold, so take a few small files from
+            // anywhere in the cache.
+            kind = "anywhere for"
+            ids = smallFiles(in: nil, excluding: opened, budget: 256 << 10, limit: 2)
+        }
+        guard !ids.isEmpty else {
+            log.notice("prefetching 0 small files for \(opened ?? dirId, privacy: .public) (no undownloaded candidates)")
+            return
+        }
         log.notice("prefetching \(ids.count) small files \(kind, privacy: .public) \(opened ?? dirId, privacy: .public)")
         for id in ids {
             manager.requestDownloadForItem(withIdentifier: NSFileProviderItemIdentifier(id)) { error in
@@ -227,18 +237,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         completionHandler()
     }
 
-    /// Small files of a cached listing not yet fetched or requested by this
-    /// process, smallest first; marks them requested.
-    private func smallFiles(in dirId: String, excluding: String?, budget: UInt64, limit: Int) -> [String] {
-        guard let core, let items = try? core.page(dirId: dirId, offset: 0, limit: 2000) else { return [] }
+    /// Small files never downloaded (per the cache's record of fetches) and
+    /// not yet requested by this process: in `dirId` smallest first, or
+    /// (`nil`) anywhere at random. Marks them requested.
+    private func smallFiles(in dirId: String?, excluding: String?, budget: UInt64, limit: Int) -> [String] {
+        guard let core, let items = try? core.smallUnfetchedFiles(dirId: dirId, maxSize: 256 * 1024, limit: 200) else {
+            return []
+        }
         var budget = budget
         var out: [String] = []
         lock.lock()
         defer { lock.unlock() }
-        for i in items.sorted(by: { $0.size < $1.size })
-        where i.kind == .file && i.id != excluding && i.size > 0 && i.size < 256 * 1024 && !i.name.hasPrefix(".")
-            && !filesRequested.contains(i.id) {
-            guard i.size <= budget, out.count < limit else { break }
+        for i in items where i.id != excluding && !filesRequested.contains(i.id) {
+            guard out.count < limit else { break }
+            guard i.size <= budget else { continue }
             budget -= i.size
             out.append(i.id)
         }
@@ -251,10 +263,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     /// ask for them again).
     private var filesRequested: Set<String> = []
 
-    private func noteFetched(_ id: String) {
+    private func noteFetched(_ id: String, contentRev: UInt64) {
         lock.lock()
         filesRequested.insert(id)
         lock.unlock()
+        try? core?.noteFetched(id: id, contentRev: contentRev)
     }
 
     private func tempURL() throws -> URL {
@@ -284,7 +297,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 raw.contentRev = done.contentRev
                 self.noteOutcome(nil)
                 log.notice("fetched \(id, privacy: .public) \(done.bytes) bytes in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
-                self.noteFetched(id)
+                self.noteFetched(id, contentRev: done.contentRev)
                 completionHandler(url, Item(raw), nil)
                 self.prefetchNearby(dirId: raw.parentId, opened: id, request: request)
             } catch {
@@ -364,7 +377,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                                      : NSRange(location: Int(offset), length: Int(done.bytes))
                 self.noteOutcome(nil)
                 log.notice("fetched \(id, privacy: .public) range \(range.location)+\(range.length) in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
-                if len == 0 { self.noteFetched(id) }
+                if len == 0 { self.noteFetched(id, contentRev: done.contentRev) }
                 completionHandler(url, Item(raw), range, [], nil)
                 if len == 0 { self.prefetchNearby(dirId: raw.parentId, opened: id, request: request) }
             } catch {
