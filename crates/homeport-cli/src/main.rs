@@ -104,6 +104,11 @@ enum Cmd {
     },
     /// Put a trashed item (by id) back.
     Untrash { id: String, dir: String, name: String },
+    /// Ask --server who it is without a pinned certificate (as pairing does).
+    Probe {
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -224,6 +229,20 @@ async fn main() {
 }
 
 async fn run(args: Args) -> Result<(), CliError> {
+    if let Cmd::Probe { timeout_ms } = args.cmd {
+        let p = homeport_client::probe(args.server, Duration::from_millis(timeout_ms)).await?;
+        let fp: String = p.fingerprint.iter().map(|b| format!("{b:02x}")).collect();
+        let shares: Vec<&str> = p.roots.iter().map(|r| r.name.as_str()).collect();
+        println!("name         {}", p.server.name);
+        println!("os           {:?} (homeportd {})", p.server.os, p.server.version);
+        println!("case         sensitive={} normalization_sensitive={}", p.server.case_sensitive, p.server.normalization_sensitive);
+        println!("caps         {:#x}", p.server.caps);
+        println!("shares       {}", shares.join(", "));
+        println!("fingerprint  {fp}");
+        println!("code         {}", homeport_proto::pairing_code(&p.fingerprint));
+        println!("answered in  {:.1} ms", p.elapsed.as_secs_f64() * 1000.0);
+        return Ok(());
+    }
     let mut cfg = Config::new(args.server, fingerprint(args.fingerprint)?, client_id());
     cfg.request_deadline = Duration::from_millis(args.deadline_ms);
     let c = Client::connect(cfg).await?;
@@ -399,6 +418,7 @@ async fn run(args: Args) -> Result<(), CliError> {
             let item = c.untrash(&id, &d.id, &name).await?;
             print_item(&mut out, &item)?;
         }
+        Cmd::Probe { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
 }

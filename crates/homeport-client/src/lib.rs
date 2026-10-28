@@ -1076,3 +1076,65 @@ async fn sample_loop(inner: Weak<Inner>) {
         lock(&i.link).on_sample(Instant::now(), sample);
     }
 }
+
+/// What a server says about itself before it is paired.
+#[derive(Clone, Debug)]
+pub struct Probe {
+    /// SHA-256 of the certificate it presented (to pin after the person
+    /// confirms the pairing code).
+    pub fingerprint: [u8; 32],
+    pub server: proto::ServerInfo,
+    pub roots: Vec<Item>,
+    /// Handshake plus `Hello`.
+    pub elapsed: Duration,
+}
+
+/// Connects to `server` without a pinned certificate (trust on first use),
+/// sends `Hello` and closes. A server that refuses this peer (not in its
+/// allowlist) is `Error::Server { code: Denied }`.
+pub async fn probe(server: SocketAddr, timeout: Duration) -> Result<Probe> {
+    let started = Instant::now();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(tls::RecordingVerifier::new(provider.clone()));
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| Error::Config(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier.clone())
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![proto::ALPN.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|e| Error::Config(e.to_string()))?;
+    let mut qc = quinn::ClientConfig::new(Arc::new(crypto));
+    qc.transport_config(Arc::new(transport_config(Congestion::DEFAULT)));
+    let bind: SocketAddr = if server.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
+    let endpoint = Endpoint::client(bind).map_err(|e| Error::Config(format!("bind UDP socket: {e}")))?;
+    let hello = async {
+        let conn = endpoint.connect_with(qc, server, proto::SERVER_NAME).map_err(|e| Error::Config(e.to_string()))?;
+        let conn = conn.await.map_err(|e| match e {
+            quinn::ConnectionError::ConnectionClosed(ref c) if c.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED => {
+                Error::Server { code: ErrorCode::Denied, message: "the server does not allow this Tailscale login".into() }
+            }
+            e => e.into(),
+        })?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let body = RequestBody::Hello { protocol: proto::PROTOCOL_VERSION, client_id: "homeport-probe".into() };
+        send.write_all(&proto::encode_frame(&Request { priority: Priority::UserOpen, body })?).await?;
+        send.finish().ok();
+        let mut prefix = [0u8; 4];
+        recv.read_exact(&mut prefix).await?;
+        let mut payload = vec![0u8; proto::check_len(prefix)?];
+        recv.read_exact(&mut payload).await?;
+        let resp: Response = proto::decode(&payload)?;
+        conn.close(quinn::VarInt::from_u32(0), b"probe done");
+        match resp {
+            Response::Hello { server, roots, .. } => Ok((server, roots)),
+            Response::Error { code, message } => Err(Error::Server { code, message }),
+            other => Err(unexpected(&other)),
+        }
+    };
+    let (info, roots) = tokio::time::timeout(timeout, hello)
+        .await
+        .map_err(|_| Error::Unreachable(format!("no answer within {} ms", timeout.as_millis())))??;
+    let fingerprint = (*lock(&verifier.seen)).ok_or_else(|| Error::Protocol("no certificate seen".into()))?;
+    Ok(Probe { fingerprint, server: info, roots, elapsed: started.elapsed() })
+}

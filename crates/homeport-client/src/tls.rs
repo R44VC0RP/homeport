@@ -73,3 +73,54 @@ impl ServerCertVerifier for PinnedVerifier {
         self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
+
+/// Trust on first use: accepts any certificate (the handshake still proves
+/// the server holds its key) and records its SHA-256, for pairing.
+#[derive(Debug)]
+pub struct RecordingVerifier {
+    pub seen: std::sync::Mutex<Option<[u8; 32]>>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl RecordingVerifier {
+    pub fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self { seen: std::sync::Mutex::new(None), provider }
+    }
+}
+
+impl ServerCertVerifier for RecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        let fp: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = Some(fp);
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}

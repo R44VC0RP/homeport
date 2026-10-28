@@ -57,6 +57,14 @@ pub enum CoreError {
     /// unsupported item); retrying will not help.
     #[error("rejected: {msg}")]
     Rejected { msg: String },
+    /// The file's content is not on the server's disk (a cloud placeholder
+    /// such as iCloud or OneDrive files on demand); the server will not
+    /// download it.
+    #[error("only in the cloud on the server: {msg}")]
+    CloudOnly { msg: String },
+    /// The server does not allow this client's Tailscale login.
+    #[error("not allowed: {msg}")]
+    Denied { msg: String },
 }
 
 impl From<ClientError> for CoreError {
@@ -66,6 +74,7 @@ impl From<ClientError> for CoreError {
             ClientError::Server { code: ErrorCode::NotFound | ErrorCode::OutsideShare, message } => {
                 Self::NotFound { msg: message }
             }
+            ClientError::Server { code: ErrorCode::CloudOnly, message } => Self::CloudOnly { msg: message },
             ClientError::Server { message, .. } => Self::Server { msg: message },
             ClientError::AnchorExpired { index_id, seq } => Self::AnchorExpired { index_id, seq },
             e @ ClientError::Protocol(_) => Self::Server { msg: e.to_string() },
@@ -97,10 +106,10 @@ fn write_error(s: &Shared, e: ClientError) -> CoreError {
                 | ErrorCode::Unsupported
                 | ErrorCode::BadRequest
                 | ErrorCode::NotADirectory
-                | ErrorCode::NotAFile
-                | ErrorCode::CloudOnly,
+                | ErrorCode::NotAFile,
             message,
         } => CoreError::Rejected { msg: message },
+        ClientError::Server { code: ErrorCode::CloudOnly, message } => CoreError::CloudOnly { msg: message },
         e => e.into(),
     }
 }
@@ -648,8 +657,7 @@ impl Core {
 impl Core {
     #[uniffi::constructor]
     pub fn new(config: CoreConfig) -> Result<Arc<Self>> {
-        let server: SocketAddr =
-            config.server.parse().map_err(|e| CoreError::Config { msg: format!("server {:?}: {e}", config.server) })?;
+        let server = resolve_addr(&config.server)?;
         let fingerprint = homeport_client::parse_fingerprint(&config.fingerprint)
             .ok_or_else(|| CoreError::Config { msg: "fingerprint must be 64 hex digits".into() })?;
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1097,6 +1105,11 @@ impl Core {
         }
     }
 
+    /// What the server said about itself on the current (or last) connection.
+    pub fn server_info(&self) -> Option<FfiServerInfo> {
+        self.shared.client.hello().map(|h| h.server.into())
+    }
+
     /// One app-level ping; milliseconds.
     pub async fn ping(&self) -> Result<f64> {
         self.run(|s: Arc<Shared>| async move { Ok(s.client.ping().await?.as_secs_f64() * 1000.0) }).await
@@ -1109,6 +1122,120 @@ impl Core {
         *lock(&self.shared.pending) = Pending::default();
         Ok(())
     }
+}
+
+/// Facts about a server (`Hello`'s `ServerInfo`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiServerInfo {
+    pub name: String,
+    /// `macOS`, `Linux`, `Windows` or `Other`.
+    pub os: String,
+    pub version: String,
+    pub case_sensitive: bool,
+    pub normalization_sensitive: bool,
+    /// `homeport_proto::caps` bits.
+    pub caps: u32,
+}
+
+impl From<proto::ServerInfo> for FfiServerInfo {
+    fn from(i: proto::ServerInfo) -> Self {
+        Self {
+            name: i.name,
+            os: match i.os {
+                proto::Os::MacOs => "macOS",
+                proto::Os::Linux => "Linux",
+                proto::Os::Windows => "Windows",
+                proto::Os::Other => "Other",
+            }
+            .to_owned(),
+            version: i.version,
+            case_sensitive: i.case_sensitive,
+            normalization_sensitive: i.normalization_sensitive,
+            caps: i.caps,
+        }
+    }
+}
+
+/// A server that answered a pairing probe.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProbeInfo {
+    /// `ip:port` it answered on.
+    pub address: String,
+    /// Hex SHA-256 of its certificate (pin it once the person confirms `code`).
+    pub fingerprint: String,
+    /// The 6-digit code `homeportd pair` shows for the same certificate.
+    pub code: String,
+    pub info: FfiServerInfo,
+    pub shares: Vec<String>,
+    pub elapsed_ms: f64,
+}
+
+/// `ip:port`, `ip` (default port) or `host[:port]` (resolved now).
+fn resolve_addr(s: &str) -> Result<SocketAddr> {
+    let s = s.trim();
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Ok(a);
+    }
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, proto::DEFAULT_PORT));
+    }
+    let with_port = if s.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        s.to_owned()
+    } else {
+        format!("{s}:{}", proto::DEFAULT_PORT)
+    };
+    use std::net::ToSocketAddrs;
+    let mut addrs: Vec<SocketAddr> = with_port
+        .to_socket_addrs()
+        .map_err(|e| CoreError::Config { msg: format!("server {s:?}: {e}") })?
+        .collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    addrs.into_iter().next().ok_or_else(|| CoreError::Config { msg: format!("server {s:?}: no address") })
+}
+
+/// Runtime for calls that are not tied to a `Core` (pairing probes).
+fn probe_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("homeport-probe")
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
+}
+
+/// Asks `address` who it is without a pinned certificate (trust on first
+/// use). Fails with `Unreachable` when nothing answers within `timeout_ms`,
+/// `Denied` when the server does not allow this login.
+#[uniffi::export]
+pub async fn probe_server(address: String, timeout_ms: u32) -> Result<ProbeInfo> {
+    probe_runtime()
+        .spawn(async move {
+            let addr = resolve_addr(&address)?;
+            let timeout = Duration::from_millis(u64::from(timeout_ms.max(100)));
+            let p = homeport_client::probe(addr, timeout).await.map_err(|e| match e {
+                ClientError::Server { code: ErrorCode::Denied, message } => CoreError::Denied { msg: message },
+                e => e.into(),
+            })?;
+            Ok(ProbeInfo {
+                address: addr.to_string(),
+                fingerprint: p.fingerprint.iter().map(|b| format!("{b:02x}")).collect(),
+                code: proto::pairing_code(&p.fingerprint),
+                info: p.server.into(),
+                shares: p.roots.into_iter().map(|r| r.name).collect(),
+                elapsed_ms: p.elapsed.as_secs_f64() * 1000.0,
+            })
+        })
+        .await
+        .map_err(|e| CoreError::Io { msg: format!("task: {e}") })?
+}
+
+/// The 6-digit pairing code of a hex fingerprint (`None` if malformed).
+#[uniffi::export]
+pub fn pairing_code(fingerprint: String) -> Option<String> {
+    homeport_client::parse_fingerprint(&fingerprint).map(|fp| proto::pairing_code(&fp))
 }
 
 /// Names never uploaded: Finder metadata and editor temporary files.
