@@ -761,7 +761,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "homeport-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "futures",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "homeport-client"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "futures",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "homeport-ffi"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "futures",
  "homeport-client",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "homeport-netsim"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "libc",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "homeport-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "postcard",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "homeportd"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "clap",
