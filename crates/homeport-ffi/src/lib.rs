@@ -544,6 +544,17 @@ impl Shared {
     /// Applies server changes to the cache; returns what the system should hear about.
     fn apply(&self, changed: Vec<CachedItem>, deleted: Vec<String>) -> Result<(Vec<CachedItem>, Vec<String>)> {
         let Some(mut c) = self.cache() else { return Ok((changed, deleted)) };
+        // A deleted folder takes everything below it along. The server only
+        // reports the folder; reporting each known descendant too means the
+        // system never depends on its own recursive cleanup (which can stop
+        // part way, leaving items under a folder that no longer exists).
+        let changed_ids: HashSet<&str> = changed.iter().map(|i| i.item.id.as_str()).collect();
+        let mut deleted = deleted;
+        let mut extra = Vec::new();
+        for id in &deleted {
+            extra.extend(c.descendants(id)?.into_iter().filter(|d| !changed_ids.contains(d.as_str())));
+        }
+        deleted.extend(extra);
         // A folder's first listing indexes it on the server, so its items come
         // back in the change feed with the listing's own revisions. The
         // system already has those from the enumeration: reporting them again

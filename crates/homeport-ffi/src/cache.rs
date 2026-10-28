@@ -244,6 +244,24 @@ impl Cache {
         Ok(())
     }
 
+    /// Every cached item below folder `id` (children first, then theirs).
+    pub fn descendants(&self, id: &str) -> rusqlite::Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut queue = vec![id.to_owned()];
+        let mut st = self.db.prepare_cached("SELECT id, kind FROM items WHERE parent_id = ?1")?;
+        while let Some(dir) = queue.pop() {
+            let rows = st.query_map([&dir], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (child, kind) = row?;
+                if kind_from_i64(kind) == Kind::Dir {
+                    queue.push(child.clone());
+                }
+                out.push(child);
+            }
+        }
+        Ok(out)
+    }
+
     /// Forgets an item (and a folder's cached listing).
     pub fn remove_item(&self, id: &str) -> rusqlite::Result<()> {
         self.db.execute("DELETE FROM items WHERE id = ?1", [id])?;
