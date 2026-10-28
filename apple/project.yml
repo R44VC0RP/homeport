@@ -75,6 +75,8 @@ targets:
           NSExtensionFileProviderDocumentGroup: 9G68SMNHEU.dev.vogel.homeport
           NSExtensionFileProviderSupportsEnumeration: true
           NSExtensionFileProviderDownloadPipelineDepth: 8
+          NSExtensionFileProviderUploadPipelineDepth: 64
+          NSExtensionFileProviderMetadataOnlyUploadPipelineDepth: 32
           NSFileProviderDecorations:
             - Identifier: dev.vogel.homeport.HomeportFP.disconnected
               BadgeImageType: com.apple.icon-decoration.badge.warning

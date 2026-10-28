@@ -19,12 +19,76 @@ func fpError(_ error: Error) -> NSError {
     case .Server(let msg), .Io(let msg), .Config(let msg):
         return NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError,
                        userInfo: [NSLocalizedDescriptionKey: msg])
+    case .Collision(let id):
+        // Callers turn this into fileProviderErrorForCollision(with:).
+        return NSFileProviderError(.filenameCollision, userInfo: [NSLocalizedDescriptionKey: "name is taken by \(id)"]) as NSError
+    case .NotEmpty:
+        return NSFileProviderError(.directoryNotEmpty) as NSError
+    case .NoSpace:
+        return NSFileProviderError(.insufficientQuota) as NSError
+    case .Rejected(let msg):
+        let underlying = NSError(domain: "dev.vogel.homeport", code: 1, userInfo: [NSLocalizedDescriptionKey: msg])
+        return NSFileProviderError(.cannotSynchronize, userInfo: [NSUnderlyingErrorKey: underlying]) as NSError
     }
 }
 
-/// Read-only error for writes in this phase.
-private func readOnlyError() -> NSError {
-    NSFileProviderError(.cannotSynchronize) as NSError
+/// Errors of write calls: transient server and I/O failures are retried by the system.
+func fpWriteError(_ error: Error) -> NSError {
+    if let e = error as? CoreError {
+        switch e {
+        case .Server(let msg), .Io(let msg):
+            return NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError,
+                           userInfo: [NSLocalizedDescriptionKey: msg])
+        default: break
+        }
+    }
+    return fpError(error)
+}
+
+private func nanos(_ d: Date) -> Int64 { Int64((d.timeIntervalSince1970 * 1e9).rounded()) }
+
+/// Big-endian content revision from an item version (nil before the first sync).
+private func contentRev(_ v: NSFileProviderItemVersion) -> UInt64? {
+    let d = v.contentVersion
+    guard d.count == 8, d != NSFileProviderItemVersion.beforeFirstSyncComponent else { return nil }
+    return d.reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+}
+
+/// The metadata of `item` named by `fields`, for the server. `current` is
+/// the item as the server has it (its mode is the base for permission flags).
+private func serverMeta(_ item: NSFileProviderItem, fields: NSFileProviderItemFields, current: FfiItem?,
+                        isDir: Bool) -> FfiMeta {
+    var m = FfiMeta(mtimeNs: nil, crtimeNs: nil, mode: nil, hidden: nil, setTags: false, tags: nil, xattrs: [:])
+    // A folder's modification time on basebook tracks its own changes;
+    // the local one (changed by every create here) is not pushed.
+    if !isDir, fields.contains(.contentModificationDate), let d = item.contentModificationDate ?? nil { m.mtimeNs = nanos(d) }
+    if fields.contains(.creationDate), let d = item.creationDate ?? nil { m.crtimeNs = nanos(d) }
+    if fields.contains(.fileSystemFlags), let f = item.fileSystemFlags {
+        var mode = current?.mode ?? (isDir ? 0o755 : 0o644)
+        if !isDir {
+            if f.contains(.userExecutable) {
+                if mode & 0o100 == 0 { mode |= 0o100 | (mode & 0o044) >> 2 }
+            } else {
+                mode &= ~UInt32(0o111)
+            }
+        }
+        if f.contains(.userWritable) { mode |= 0o200 } else { mode &= ~UInt32(0o222) }
+        if mode != current?.mode { m.mode = mode }
+        let hidden = f.contains(.hidden)
+        if hidden != ((current?.flags ?? 0) & 0x8000 != 0) { m.hidden = hidden }
+    }
+    if fields.contains(.tagData) {
+        m.setTags = true
+        m.tags = (item.tagData ?? nil).flatMap(TagCodec.xattr(fromTagData:))
+    }
+    if fields.contains(.extendedAttributes), let x = item.extendedAttributes {
+        m.xattrs = x
+    }
+    return m
+}
+
+private func isEmpty(_ m: FfiMeta) -> Bool {
+    m.mtimeNs == nil && m.crtimeNs == nil && m.mode == nil && m.hidden == nil && !m.setTags && m.xattrs.isEmpty
 }
 
 private final class ProgressForwarder: ProgressSink, @unchecked Sendable {
@@ -500,26 +564,224 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         return progress
     }
 
+    /// The item behind a collision, for fileProviderErrorForCollision(with:).
+    private func collisionError(_ error: Error) -> NSError? {
+        guard let e = error as? CoreError, case .Collision(let id) = e, let core,
+              let existing = try? core.cachedItem(id: id) else { return nil }
+        return NSError.fileProviderErrorForCollision(with: Item(existing))
+    }
+
     func createItem(basedOn itemTemplate: NSFileProviderItem, fields: NSFileProviderItemFields, contents url: URL?,
                     options: NSFileProviderCreateItemOptions = [], request: NSFileProviderRequest,
                     completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
-        completionHandler(nil, [], false, readOnlyError())
-        return Progress()
+        let progress = Progress(totalUnitCount: 1)
+        let name = itemTemplate.filename
+        guard let core else {
+            completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        // Junk (.DS_Store, editor temporaries), and anything outside the
+        // shares (the root itself, items created right in the Trash) stays local.
+        let parentId = ItemID.server(itemTemplate.parentItemIdentifier)
+        if isJunkName(name: name) || parentId == nil || parentId == ItemID.serverRoot || parentId == ItemID.serverTrash {
+            log.notice("create \(name, privacy: .public): excluded from sync")
+            completionHandler(nil, [], false, NSFileProviderError(.excludedFromSync))
+            return progress
+        }
+        let type = itemTemplate.contentType ?? .data
+        var isDirURL: ObjCBool = false
+        let urlIsDir = url.map { FileManager.default.fileExists(atPath: $0.path, isDirectory: &isDirURL) && isDirURL.boolValue } ?? false
+        let kind: ItemKind
+        if type.conforms(to: .symbolicLink) {
+            kind = .symlink
+        } else if type.conforms(to: .folder) || type.conforms(to: .directory) || urlIsDir {
+            kind = .dir
+        } else {
+            kind = .file
+        }
+        let isPackage = kind == .dir && urlIsDir
+        let size = (kind == .file ? url.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } : nil) ?? 0
+        progress.totalUnitCount = Int64(max(size, 1))
+        let token = CancelToken()
+        progress.cancellationHandler = { token.cancel() }
+        let meta = serverMeta(itemTemplate, fields: fields, current: nil, isDir: kind == .dir)
+        let opId = itemTemplate.itemIdentifier.rawValue
+        let echo = ItemEcho(from: itemTemplate)
+        let started = Date()
+        Task {
+            do {
+                var raw = try await core.createItem(
+                    opId: opId, parentId: parentId!, name: name, kind: kind,
+                    contentPath: kind == .file ? url?.path : nil,
+                    linkTarget: kind == .symlink ? (itemTemplate.symlinkTargetPath ?? nil) : nil,
+                    meta: meta, mayExist: options.contains(.mayAlreadyExist),
+                    progress: ProgressForwarder(progress), cancel: token)
+                if isPackage, let url {
+                    try await self.uploadTree(url, into: raw.id, core: core, token: token)
+                    raw = try await core.item(id: raw.id)
+                }
+                progress.completedUnitCount = progress.totalUnitCount
+                self.noteOutcome(nil)
+                log.notice("created \(name, privacy: .public) (\(String(describing: kind), privacy: .public), \(size) bytes) as \(raw.id, privacy: .public) in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+                completionHandler(Item(raw, echo: echo), [], false, nil)
+            } catch {
+                self.noteOutcome(error)
+                if let c = self.collisionError(error) {
+                    log.notice("create \(name, privacy: .public): name taken")
+                    completionHandler(nil, [], false, c)
+                    return
+                }
+                log.error("create \(name, privacy: .public) failed after \(Int(Date().timeIntervalSince(started) * 1000)) ms: \(String(describing: error), privacy: .public)")
+                completionHandler(nil, [], false, fpWriteError(error))
+            }
+        }
+        return progress
+    }
+
+    /// A package (an .app, .xcodeproj, .rtfd...) arrives as one item whose
+    /// URL is a directory: its contents are uploaded here, item by item.
+    private func uploadTree(_ dir: URL, into parentId: String, core: Core, token: CancelToken) async throws {
+        let fm = FileManager.default
+        for child in try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
+            let name = child.lastPathComponent
+            if isJunkName(name: name) { continue }
+            let v = try child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey])
+            var meta = FfiMeta(mtimeNs: v.contentModificationDate.map(nanos), crtimeNs: nil, mode: nil, hidden: nil,
+                               setTags: false, tags: nil, xattrs: [:])
+            if let attrs = try? fm.attributesOfItem(atPath: child.path), let p = attrs[.posixPermissions] as? NSNumber {
+                meta.mode = p.uint32Value
+            }
+            let op = "pkg-\(parentId)-\(name)"
+            if v.isSymbolicLink == true {
+                let target = try fm.destinationOfSymbolicLink(atPath: child.path)
+                _ = try? await core.createItem(opId: op, parentId: parentId, name: name, kind: .symlink, contentPath: nil,
+                                               linkTarget: target, meta: meta, mayExist: true, progress: nil, cancel: token)
+            } else if v.isDirectory == true {
+                let d = try await core.createItem(opId: op, parentId: parentId, name: name, kind: .dir, contentPath: nil,
+                                                  linkTarget: nil, meta: meta, mayExist: true, progress: nil, cancel: token)
+                try await uploadTree(child, into: d.id, core: core, token: token)
+            } else {
+                _ = try await core.createItem(opId: op, parentId: parentId, name: name, kind: .file, contentPath: child.path,
+                                              linkTarget: nil, meta: meta, mayExist: true, progress: nil, cancel: token)
+            }
+        }
     }
 
     func modifyItem(_ item: NSFileProviderItem, baseVersion version: NSFileProviderItemVersion, changedFields: NSFileProviderItemFields,
                     contents newContents: URL?, options: NSFileProviderModifyItemOptions = [], request: NSFileProviderRequest,
                     completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
-        completionHandler(nil, [], false, readOnlyError())
-        return Progress()
+        let progress = Progress(totalUnitCount: 1)
+        guard let core, let id = ItemID.server(item.itemIdentifier) else {
+            completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+            return progress
+        }
+        let echo = ItemEcho(from: item)
+        let cached = try? core.cachedItem(id: id)
+        if id == ItemID.serverRoot || ItemID.isShareRoot(id) {
+            // Nothing about the root or the shares can change from here.
+            let raw = cached ?? Item.root(offline: nil).raw
+            completionHandler(Item(raw, echo: echo), [], false, nil)
+            return progress
+        }
+        let isDir = cached?.kind == .dir || (item.contentType ?? .data).conforms(to: .folder)
+        let inTrash = cached?.parentId == ItemID.serverTrash
+        let toTrash = changedFields.contains(.parentItemIdentifier) && item.parentItemIdentifier == .trashContainer
+        let move = changedFields.contains(.parentItemIdentifier) || changedFields.contains(.filename)
+        let contents = changedFields.contains(.contents) && newContents != nil
+        let meta = serverMeta(item, fields: changedFields, current: cached, isDir: isDir)
+        let size = newContents.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } ?? 0
+        progress.totalUnitCount = Int64(max(size, 1))
+        let token = CancelToken()
+        progress.cancellationHandler = { token.cancel() }
+        let started = Date()
+        let what = "\(id) \(item.filename) fields=\(changedFields.rawValue)"
+        Task {
+            do {
+                var current: FfiItem? = nil
+                var fetch = false
+                var metaDone = false
+                if toTrash && !inTrash {
+                    current = try await core.trashItem(id: id, listed: true, recursive: true)
+                } else if move && inTrash && !toTrash {
+                    guard let parent = ItemID.server(item.parentItemIdentifier) else { throw NSFileProviderError(.noSuchItem) }
+                    current = try await core.untrashItem(id: id, parentId: parent, name: item.filename)
+                } else if move && !inTrash {
+                    let parent = changedFields.contains(.parentItemIdentifier) ? ItemID.server(item.parentItemIdentifier) : nil
+                    let name = changedFields.contains(.filename) ? item.filename : nil
+                    current = try await core.modifyItem(id: id, newParentId: parent, newName: name,
+                                                        meta: contents ? serverMeta(item, fields: [], current: cached, isDir: isDir) : meta)
+                    metaDone = !contents
+                }
+                if contents, let url = newContents, !inTrash && !toTrash {
+                    let out = try await core.writeContent(id: id, baseContentRev: contentRev(version), contentPath: url.path,
+                                                          meta: meta, progress: ProgressForwarder(progress), cancel: token)
+                    current = out.item
+                    metaDone = true
+                    if let copy = out.conflict {
+                        // The edit lives on as the copy; this item gets the server's content.
+                        fetch = true
+                        log.notice("conflict on \(item.filename, privacy: .public): kept the edit as \(copy.name, privacy: .public)")
+                        self.signalWorkingSet()
+                    }
+                }
+                if !metaDone && !isEmpty(meta) && !inTrash && !toTrash {
+                    current = try await core.modifyItem(id: id, newParentId: nil, newName: nil, meta: meta)
+                }
+                let raw: FfiItem
+                if let current { raw = current } else if let cached { raw = cached } else { raw = try await core.item(id: id) }
+                progress.completedUnitCount = progress.totalUnitCount
+                self.noteOutcome(nil)
+                log.notice("modified \(what, privacy: .public) (\(size) bytes) in \(Int(Date().timeIntervalSince(started) * 1000)) ms\(fetch ? " (conflict)" : "", privacy: .public)")
+                completionHandler(Item(raw, echo: echo), [], fetch, nil)
+            } catch {
+                self.noteOutcome(error)
+                if let c = self.collisionError(error) {
+                    log.notice("modify \(what, privacy: .public): name taken")
+                    completionHandler(nil, [], false, c)
+                    return
+                }
+                log.error("modify \(what, privacy: .public) failed after \(Int(Date().timeIntervalSince(started) * 1000)) ms: \(String(describing: error), privacy: .public)")
+                completionHandler(nil, [], false, fpWriteError(error))
+            }
+        }
+        return progress
     }
 
+    /// Deletes never destroy anything on basebook: an item deleted here
+    /// moves to basebook's Trash, and emptying this Mac's Trash only drops
+    /// the items from the trash container (they stay in basebook's Trash).
     func deleteItem(identifier: NSFileProviderItemIdentifier, baseVersion version: NSFileProviderItemVersion,
                     options: NSFileProviderDeleteItemOptions = [], request: NSFileProviderRequest,
                     completionHandler: @escaping (Error?) -> Void) -> Progress {
-        // The system restores the item from the extension.
-        completionHandler(NSFileProviderError(.deletionRejected))
-        return Progress()
+        let progress = Progress(totalUnitCount: 1)
+        guard let core, let id = ItemID.server(identifier) else {
+            completionHandler(nil)
+            return progress
+        }
+        if id == ItemID.serverRoot || ItemID.isShareRoot(id) || id == ItemID.serverTrash {
+            completionHandler(NSFileProviderError(.deletionRejected))
+            return progress
+        }
+        let inTrash = (try? core.cachedItem(id: id))??.parentId == ItemID.serverTrash
+        Task {
+            do {
+                if inTrash {
+                    try await core.forgetItem(id: id)
+                } else {
+                    _ = try await core.trashItem(id: id, listed: false, recursive: options.contains(.recursive))
+                }
+                self.noteOutcome(nil)
+                log.notice("deleted \(id, privacy: .public) (\(inTrash ? "left in basebook's Trash" : "moved to basebook's Trash", privacy: .public))")
+                completionHandler(nil)
+            } catch CoreError.NotFound {
+                completionHandler(nil)
+            } catch {
+                self.noteOutcome(error)
+                log.error("delete \(id, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                completionHandler(fpWriteError(error))
+            }
+        }
+        return progress
     }
 
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
