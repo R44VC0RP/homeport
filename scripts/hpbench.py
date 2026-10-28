@@ -8,6 +8,10 @@ way an app sees them, then saves a unified log excerpt beside the results.
     python3 hpbench.py walk DIR     # list DIR, then each child folder (Finder-like)
     python3 hpbench.py clicks 30    # random "clicks": dev -> repo -> subfolder ... (any state),
                                     # then opens a random small file in each folder reached
+    python3 hpbench.py siblings 8   # in 8 deeper folders: open one dataless small file, wait 1 s,
+                                    # then open 3 more beside it
+    python3 hpbench.py finder 8     # show 8 deeper folders in Finder (`open`), wait 3 s, then
+                                    # open small files in them (needs Finder automation allowed)
 
 Prints one line per access and p50/p90/max. Writes the log to
 $TMPDIR/hpbench-<time>.log.
@@ -125,11 +129,60 @@ def run_clicks(n):
     summary("click open", opens)
 
 
+def deep_folders(n):
+    """Materialized folders below a repo's top level with >= 4 small dataless files."""
+    dev = os.path.join(ROOT, "dev")
+    repos = [d for d in os.listdir(dev) if not d.startswith(".")]
+    random.shuffle(repos)
+    out = []
+    for r in repos:
+        rp = os.path.join(dev, r)
+        if not os.path.isdir(rp) or dataless(rp):
+            continue
+        for c in os.listdir(rp):
+            p = os.path.join(rp, c)
+            if c.startswith(".") or c in SKIP or os.path.islink(p) or not os.path.isdir(p) or dataless(p):
+                continue
+            fs = [os.path.join(p, f) for f in os.listdir(p) if not f.startswith(".")]
+            fs = [f for f in fs if os.path.isfile(f) and dataless(f) and 0 < os.lstat(f).st_size < 256 * 1024]
+            if len(fs) >= 4:
+                out.append((p, fs))
+                break
+        if len(out) >= n:
+            break
+    return out
+
+
+def run_siblings(n):
+    first, rest = [], []
+    for _, fs in deep_folders(n):
+        random.shuffle(fs)
+        first.append(timed(read, fs[0]))
+        time.sleep(1)
+        rest += [timed(read, f) for f in fs[1:4]]
+    summary("first open in folder", first)
+    summary("next opens beside it", rest)
+
+
+def run_finder(n):
+    ts = []
+    for p, fs in deep_folders(n):
+        subprocess.run(["open", p])
+        time.sleep(3)
+        random.shuffle(fs)
+        ts += [timed(read, f) for f in fs[:3]]
+    summary("open after Finder showed the folder", ts)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "both"
     start = time.time()
     if mode == "walk":
         run_walk(sys.argv[2])
+    elif mode == "siblings":
+        run_siblings(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    elif mode == "finder":
+        run_finder(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
     elif mode == "clicks":
         run_clicks(int(sys.argv[2]) if len(sys.argv) > 2 else 30)
     else:
