@@ -13,6 +13,8 @@ clap.workspace = true
 libc.workspace = true
 lru.workspace = true
 quinn.workspace = true
+# RttEstimator, for the congestion controller wrapper.
+quinn-proto.workspace = true
 # sendmsg_x/recvmsg_x batching on macOS: several times the packet rate at a 1232-byte MTU.
 quinn-udp.workspace = true
 rand.workspace = true

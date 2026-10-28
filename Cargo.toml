@@ -18,6 +18,7 @@ libc = "0.2"
 lru = "0.16"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn-proto = { version = "0.11", default-features = false }
 quinn-udp = { version = "0.5", features = ["fast-apple-datapath"] }
 rand = "0.9"
 rcgen = "0.14"

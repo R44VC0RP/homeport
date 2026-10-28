@@ -1,6 +1,7 @@
 //! homeportd: serves basebook's shares to Homeport clients over the tailnet.
 
 mod auth;
+mod congestion;
 mod db;
 mod fsevents;
 mod fsops;

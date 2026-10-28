@@ -48,8 +48,30 @@ enum StreamError {
     Join(#[from] tokio::task::JoinError),
 }
 
+/// Congestion controller for what the server sends: `HOMEPORT_CC` = `bbr`
+/// (default) | `cubic` | `newreno`. Under random loss (Wi-Fi, cellular)
+/// Cubic backs off on every lost packet and fills the bottleneck queue;
+/// BBR paces at the measured delivery rate.
+fn congestion() -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+    match std::env::var("HOMEPORT_CC").unwrap_or_default().to_ascii_lowercase().as_str() {
+        "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
+        "newreno" | "reno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        "" | "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
+        other => {
+            tracing::warn!(cc = other, "unknown HOMEPORT_CC; using bbr");
+            Arc::new(quinn::congestion::BbrConfig::default())
+        }
+    }
+}
+
 pub fn transport_config() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
+    // HOMEPORT_URGENT_CAP=0 turns the in-flight cap off (for comparisons).
+    if std::env::var("HOMEPORT_URGENT_CAP").is_ok_and(|v| v == "0") {
+        t.congestion_controller_factory(congestion());
+    } else {
+        t.congestion_controller_factory(Arc::new(crate::congestion::CappedFactory { inner: congestion() }));
+    }
     t.initial_mtu(1200);
     let mut mtu = quinn::MtuDiscoveryConfig::default();
     mtu.upper_bound(1232);
@@ -78,6 +100,8 @@ pub fn endpoint(identity: &Identity, bind: SocketAddr) -> Result<quinn::Endpoint
 }
 
 struct Conn {
+    conn: quinn::Connection,
+    urgency: Option<Arc<crate::congestion::Urgency>>,
     index: Arc<Index>,
     client_id: OnceLock<String>,
     peer: SocketAddr,
@@ -102,7 +126,11 @@ pub async fn serve(endpoint: quinn::Endpoint, index: Arc<Index>, auth: Arc<Autho
                 }
             };
             match conn {
-                Ok(conn) => handle_conn(conn, Arc::new(Conn { index, client_id: OnceLock::new(), peer })).await,
+                Ok(conn) => {
+                    let urgency = crate::congestion::urgency(&conn);
+                    let ctx = Arc::new(Conn { conn: conn.clone(), urgency, index, client_id: OnceLock::new(), peer });
+                    handle_conn(conn, ctx).await
+                }
                 Err(e) => tracing::debug!(%peer, error = %e, "handshake failed"),
             }
         });
@@ -159,6 +187,7 @@ async fn handle_stream(ctx: &Conn, mut send: SendStream, mut recv: RecvStream) -
         }
     };
     send.set_priority(req.priority.stream_priority())?;
+    let _urgent = ctx.urgency.as_ref().filter(|_| is_urgent(&req)).map(|u| u.begin());
     let started = Instant::now();
     let kind = request_kind(&req.body);
     let result = dispatch(ctx, &mut send, &mut recv, req.body).await;
@@ -183,6 +212,25 @@ async fn handle_stream(ctx: &Conn, mut send: SendStream, mut recv: RecvStream) -
         tracing::debug!(kind, us, "request");
     }
     Ok(())
+}
+
+/// Whether someone is waiting on this request right now: user opens and
+/// visible listings, except whole-file or large reads (those are the bulk
+/// transfers the in-flight cap holds back) and probes.
+fn is_urgent(req: &Request) -> bool {
+    use proto::Priority;
+    if !matches!(req.priority, Priority::UserOpen | Priority::Visible) {
+        return false;
+    }
+    match &req.body {
+        RequestBody::Ping { .. }
+        | RequestBody::Hello { .. }
+        | RequestBody::Changes { .. }
+        | RequestBody::Create { .. }
+        | RequestBody::WriteContent { .. } => false,
+        RequestBody::Read { len, .. } => (1..=1 << 20).contains(len),
+        _ => true,
+    }
 }
 
 fn request_kind(b: &RequestBody) -> &'static str {
@@ -345,7 +393,9 @@ async fn dispatch(
             let item = index.stat(&id).await?;
             write(send, &Response::Item(item)).await
         }
-        RequestBody::Read { id, offset, len, compress } => read(index, send, id, offset, len, compress).await,
+        RequestBody::Read { id, offset, len, compress } => {
+            read(index, send, id, offset, len, compress, chunk_size(&ctx.conn)).await
+        }
         RequestBody::Changes { since_seq, index_id, follow } => {
             changes(index, send, client, since_seq, index_id, follow).await
         }
@@ -369,6 +419,16 @@ async fn dispatch(
     }
 }
 
+/// `Data` chunk size for the connection: about 100 ms of what it currently
+/// delivers (congestion window per RTT), 16 KiB to `READ_CHUNK`. Slow links
+/// get small frames, so progress and cancellation stay responsive.
+fn chunk_size(conn: &quinn::Connection) -> usize {
+    let p = conn.stats().path;
+    let rtt = p.rtt.as_secs_f64().max(0.001);
+    let per_100ms = (p.cwnd as f64 / rtt * 0.1) as usize;
+    per_100ms.clamp(16 * 1024, proto::READ_CHUNK).next_power_of_two().min(proto::READ_CHUNK)
+}
+
 async fn read(
     index: &Arc<Index>,
     send: &mut SendStream,
@@ -376,6 +436,7 @@ async fn read(
     offset: u64,
     len: u64,
     compress: bool,
+    chunk: usize,
 ) -> Result<(), StreamError> {
     let idx = index.clone();
     let (fd, size, name, content_rev) = tokio::task::spawn_blocking(move || idx.open_file(&id)).await??;
@@ -384,11 +445,11 @@ async fn read(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, StreamError>>(8);
     let producer = tokio::task::spawn_blocking(move || {
         use std::os::fd::AsRawFd;
-        let mut buf = vec![0u8; proto::READ_CHUNK];
+        let mut buf = vec![0u8; chunk];
         let mut pos = offset;
         let mut incompressible = 0;
         while pos < end {
-            let want = (end - pos).min(proto::READ_CHUNK as u64) as usize;
+            let want = (end - pos).min(chunk as u64) as usize;
             // SAFETY: `buf` has room for `want` bytes; `fd` is open for reading.
             let n = unsafe { libc::pread(fd.as_raw_fd(), buf.as_mut_ptr().cast(), want, pos as libc::off_t) };
             if n < 0 {
