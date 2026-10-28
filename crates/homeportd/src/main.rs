@@ -6,6 +6,7 @@ mod fsevents;
 mod fsops;
 mod index;
 mod server;
+mod thumbs;
 mod tls;
 
 use std::net::{IpAddr, SocketAddr};
@@ -120,6 +121,10 @@ async fn run(args: Args) -> Result<(), MainError> {
     std::fs::create_dir_all(&data_dir)
         .map_err(|source| tls::TlsError::Io { path: data_dir.display().to_string(), source })?;
     let (db, loaded) = db::Db::open(&data_dir.join("index.sqlite"))?;
+    let thumbs_dir = home.join("Library/Caches/Homeport/thumbnails");
+    if let Err(e) = thumbs::init(thumbs_dir) {
+        tracing::warn!(error = %e, "thumbnail cache unavailable");
+    }
     let stored_event = loaded.last_event_id;
     let stored_uuid = loaded.volume_uuid.clone();
     let index = Arc::new(index::Index::new(shares, db.clone(), loaded, args.cache_dirs)?);

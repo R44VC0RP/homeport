@@ -253,6 +253,17 @@ async fn dispatch(ctx: &Conn, send: &mut SendStream, body: RequestBody) -> Resul
             changes(index, send, client, since_seq, index_id, follow).await
         }
         RequestBody::Ping { nonce } => write(send, &Response::Pong { nonce }).await,
+        // A PNG as `Data` frames then `DataEnd`; no data means no thumbnail.
+        RequestBody::Thumbnail { id, max_pixels } => {
+            let png = crate::thumbs::get(index, &id, max_pixels).await?.unwrap_or_default();
+            for (i, chunk) in png.chunks(proto::READ_CHUNK).enumerate() {
+                let offset = (i * proto::READ_CHUNK) as u64;
+                let data = Response::Data { offset, compressed: false, raw_len: chunk.len() as u32, bytes: chunk.to_vec() };
+                write(send, &data).await?;
+            }
+            let total = png.len() as u64;
+            write(send, &Response::DataEnd { total, size: total, content_rev: 0 }).await
+        }
         RequestBody::ReadLink { id } => {
             let idx = index.clone();
             let target = tokio::task::spawn_blocking(move || idx.read_link(&id)).await??;
@@ -261,8 +272,7 @@ async fn dispatch(ctx: &Conn, send: &mut SendStream, body: RequestBody) -> Resul
         RequestBody::Write { .. }
         | RequestBody::Create { .. }
         | RequestBody::Rename { .. }
-        | RequestBody::Delete { .. }
-        | RequestBody::Thumbnail { .. } => {
+        | RequestBody::Delete { .. } => {
             send.write_chunk(error_frame(ErrorCode::Unsupported, "not implemented yet")?).await?;
             Ok(())
         }

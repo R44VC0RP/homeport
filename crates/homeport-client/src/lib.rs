@@ -483,6 +483,18 @@ impl Client {
         Ok(ReadStream { resp, started: Instant::now(), wire: 0, done: None })
     }
 
+    /// A PNG thumbnail made on the server; empty when it has none for the file.
+    pub async fn thumbnail(&self, id: &str, max_pixels: u32) -> Result<Bytes> {
+        let body = RequestBody::Thumbnail { id: id.to_owned(), max_pixels };
+        let resp = self.request(Priority::Thumbnail, body).await?;
+        let mut s = ReadStream { resp, started: Instant::now(), wire: 0, done: None };
+        let mut buf = BytesMut::new();
+        while let Some((_, chunk)) = s.next_chunk().await? {
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf.freeze())
+    }
+
     /// Reads a byte range into memory. Identical concurrent calls share one request.
     pub async fn read_range(
         &self,

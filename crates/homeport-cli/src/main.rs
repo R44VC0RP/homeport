@@ -45,6 +45,12 @@ enum Cmd {
         #[arg(long)]
         compress: bool,
     },
+    /// Write the server's PNG thumbnail of a file to stdout.
+    Thumb {
+        target: String,
+        #[arg(long, default_value_t = 256)]
+        size: u32,
+    },
     /// Print the change feed for directories this client has listed.
     Changes {
         #[arg(long, default_value_t = 0)]
@@ -212,6 +218,14 @@ async fn run(args: Args) -> Result<(), CliError> {
             while let Some((_, chunk)) = s.next_chunk().await? {
                 out.write_all(&chunk)?;
             }
+            out.flush()?;
+        }
+        Cmd::Thumb { target, size } => {
+            let item = target_item(&c, &target).await?;
+            let started = std::time::Instant::now();
+            let png = c.thumbnail(&item.id, size).await?;
+            eprintln!("{} bytes in {:.1} ms", png.len(), started.elapsed().as_secs_f64() * 1000.0);
+            out.write_all(&png)?;
             out.flush()?;
         }
         Cmd::Changes { since, follow } => {

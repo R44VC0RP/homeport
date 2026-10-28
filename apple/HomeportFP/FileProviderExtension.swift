@@ -34,7 +34,8 @@ private final class ProgressForwarder: ProgressSink, @unchecked Sendable {
     }
 }
 
-final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, NSFileProviderPartialContentFetching {
+final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, NSFileProviderPartialContentFetching,
+    NSFileProviderThumbnailing {
     let domain: NSFileProviderDomain
     let manager: NSFileProviderManager?
     let core: Core?
@@ -233,6 +234,66 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 completionHandler(nil, nil, NSRange(), [], fpError(error))
             }
         }
+        return progress
+    }
+
+    /// File types basebook's Quick Look makes useful thumbnails for (as in
+    /// homeportd's thumbs.rs); others keep their type icon without a request.
+    private static let thumbnailExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "avif", "tif", "tiff", "bmp", "svg", "psd", "raw", "dng",
+        "cr2", "nef", "arw", "mp4", "mov", "m4v", "mkv", "webm", "avi", "pdf", "key", "pages", "numbers", "usdz", "glb",
+    ]
+
+    /// Thumbnails come from basebook, so Finder never downloads an image or
+    /// video just to draw its icon.
+    func fetchThumbnails(for itemIdentifiers: [NSFileProviderItemIdentifier], requestedSize size: CGSize,
+                         perThumbnailCompletionHandler: @escaping (NSFileProviderItemIdentifier, Data?, Error?) -> Void,
+                         completionHandler: @escaping (Error?) -> Void) -> Progress {
+        let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+        guard let core else {
+            completionHandler(NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        // Icons rarely need more than 512 px, and smaller ones are made faster.
+        let pixels = UInt32(max(64, min(512, max(size.width, size.height))))
+        let task = Task {
+            let started = Date()
+            var made = 0
+            await withTaskGroup(of: Bool.self) { group in
+                var running = 0
+                for identifier in itemIdentifiers {
+                    if Task.isCancelled { break }
+                    guard let id = ItemID.server(identifier),
+                          let item = try? core.cachedItem(id: id), item.kind == .file,
+                          Self.thumbnailExtensions.contains((item.name as NSString).pathExtension.lowercased())
+                    else {
+                        perThumbnailCompletionHandler(identifier, nil, nil)
+                        progress.completedUnitCount += 1
+                        continue
+                    }
+                    if running >= 4 {
+                        if await group.next() == true { made += 1 }
+                        running -= 1
+                    }
+                    running += 1
+                    group.addTask {
+                        defer { progress.completedUnitCount += 1 }
+                        do {
+                            let png = try await core.thumbnail(id: id, maxPixels: pixels)
+                            perThumbnailCompletionHandler(identifier, png, nil)
+                            return png != nil
+                        } catch {
+                            perThumbnailCompletionHandler(identifier, nil, fpError(error))
+                            return false
+                        }
+                    }
+                }
+                for await ok in group where ok { made += 1 }
+            }
+            log.notice("thumbnails: \(made)/\(itemIdentifiers.count) at \(pixels) px in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+            completionHandler(Task.isCancelled ? CocoaError(.userCancelled) : nil)
+        }
+        progress.cancellationHandler = { task.cancel() }
         return progress
     }
 

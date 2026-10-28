@@ -56,7 +56,7 @@ impl IndexError {
         }
     }
 
-    fn from_io(e: io::Error) -> Self {
+    pub fn from_io(e: io::Error) -> Self {
         match e.raw_os_error() {
             Some(libc::ENOENT) | Some(libc::ESTALE) => Self::NotFound,
             Some(libc::ENOTDIR) => Self::NotADirectory,
@@ -513,6 +513,16 @@ impl Index {
             }
         }
         Ok(fresh)
+    }
+
+    /// Path and content rev of a regular file (for thumbnails).
+    pub fn file_path(&self, id: &str) -> Result<(PathBuf, u64), IndexError> {
+        let Target::Path { path, .. } = self.resolve(id)? else { return Err(IndexError::NotAFile) };
+        if fsops::lstat(&path).map_err(IndexError::from_io)?.kind != Kind::File {
+            return Err(IndexError::NotAFile);
+        }
+        let content_rev = self.db.item(id)?.map_or(0, |i| i.content_rev);
+        Ok((path, content_rev))
     }
 
     /// Opens a regular file for reading. Returns the file, its size, name and content rev.

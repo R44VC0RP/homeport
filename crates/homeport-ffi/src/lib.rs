@@ -713,6 +713,18 @@ impl Core {
         .await
     }
 
+    /// A PNG thumbnail made on the server, or `None` when it has none.
+    pub async fn thumbnail(&self, id: String, max_pixels: u32) -> Result<Option<Vec<u8>>> {
+        self.run(move |s: Arc<Shared>| async move {
+            // Behind the breaker, but a slow thumbnail (Quick Look on the
+            // server can outlast the deadline) must not trip it for everything else.
+            s.check_breaker()?;
+            let png = s.client.thumbnail(&id, max_pixels).await?;
+            Ok((!png.is_empty()).then(|| png.to_vec()))
+        })
+        .await
+    }
+
     /// Calls `listener.changed()` whenever the server reports changes in
     /// directories this client id has listed. Reconnects on its own.
     pub fn subscribe(&self, listener: Arc<dyn ChangeListener>) -> Arc<Subscription> {
