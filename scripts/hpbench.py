@@ -129,8 +129,8 @@ def run_clicks(n):
     summary("click open", opens)
 
 
-def deep_folders(n):
-    """Materialized folders below a repo's top level with >= 4 small dataless files."""
+def deep_folders(n, min_files=4):
+    """Materialized folders below a repo's top level with >= min_files small dataless files."""
     dev = os.path.join(ROOT, "dev")
     repos = [d for d in os.listdir(dev) if not d.startswith(".")]
     random.shuffle(repos)
@@ -145,7 +145,7 @@ def deep_folders(n):
                 continue
             fs = [os.path.join(p, f) for f in os.listdir(p) if not f.startswith(".")]
             fs = [f for f in fs if os.path.isfile(f) and dataless(f) and 0 < os.lstat(f).st_size < 256 * 1024]
-            if len(fs) >= 4:
+            if len(fs) >= min_files:
                 out.append((p, fs))
                 break
         if len(out) >= n:
@@ -162,6 +162,14 @@ def run_siblings(n):
         rest += [timed(read, f) for f in fs[1:4]]
     summary("first open in folder", first)
     summary("next opens beside it", rest)
+
+
+def run_first(n):
+    ts = []
+    for _, fs in deep_folders(n, 1):
+        ts.append(timed(read, random.choice(fs)))
+        time.sleep(2)
+    summary("first open in folder", ts)
 
 
 def run_finder(n):
@@ -181,6 +189,8 @@ if __name__ == "__main__":
         run_walk(sys.argv[2])
     elif mode == "siblings":
         run_siblings(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    elif mode == "first":
+        run_first(int(sys.argv[2]) if len(sys.argv) > 2 else 20)
     elif mode == "finder":
         run_finder(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
     elif mode == "clicks":

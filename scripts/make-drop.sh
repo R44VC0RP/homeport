@@ -21,6 +21,7 @@ done
 app="$repo/build/DerivedData/Build/Products/Release/Homeport.app"
 version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$app/Contents/Info.plist")
 build=$(git -C "$repo" rev-parse --short HEAD)
+git -C "$repo" diff --quiet HEAD -- apple crates || build="$build-dirty"
 name="homeport-$version-$build"
 out="$repo/build/drop"
 dir="$out/$name"
