@@ -18,6 +18,13 @@ cargo build --release --manifest-path "$repo/Cargo.toml" -p homeportd
 mkdir -p "$bin_dir" "$log_dir" "$HOME/Library/LaunchAgents"
 # Copy to a temp name and rename so a running instance keeps its inode.
 cp "$repo/target/release/homeportd" "$bin_dir/homeportd.new"
+# A stable Developer ID signature keeps privacy grants (Files and Folders >
+# Downloads) across rebuilds; an ad-hoc signature changes with every build.
+identity="${HOMEPORT_SIGN_IDENTITY:-Developer ID Application: Ryan Vogel (9G68SMNHEU)}"
+if security find-identity -v -p codesigning | grep -q "$identity"; then
+  codesign --force --sign "$identity" --identifier dev.vogel.homeportd --options runtime \
+    --timestamp=none "$bin_dir/homeportd.new"
+fi
 mv -f "$bin_dir/homeportd.new" "$bin_dir/homeportd"
 
 cat > "$plist" <<EOF
@@ -62,6 +69,7 @@ echo "Unload: launchctl bootout gui/\$(id -u)/$label"
 echo "Logs:   $log_dir/homeportd.log"
 echo "Fingerprint: $support/server/cert.sha256 (created on first run)"
 echo
-echo "Note: ~/Downloads is privacy-protected. The first run from launchd may"
-echo "prompt for access, or need homeportd added under Privacy & Security >"
-echo "Files and Folders (or Full Disk Access)."
+echo "Note: ~/Downloads is privacy-protected. The first run from launchd shows"
+echo "\"homeportd would like to access files in your Downloads folder\": click Allow"
+echo "(or later: System Settings > Privacy & Security > Files and Folders >"
+echo "homeportd > Downloads Folder). Until then homeportd waits at startup."

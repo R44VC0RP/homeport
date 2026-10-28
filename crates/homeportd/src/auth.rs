@@ -33,7 +33,9 @@ pub struct Tailscale {
 impl Tailscale {
     async fn run(&self, args: &[&str]) -> Result<Vec<u8>, AuthError> {
         let cmd = format!("tailscale {}", args.join(" "));
-        let fut = Command::new(&self.bin).args(args).kill_on_drop(true).output();
+        // Without a terminal (e.g. under launchd) the Mac app's binary starts
+        // its GUI instead of acting as the CLI unless told otherwise.
+        let fut = Command::new(&self.bin).args(args).env("TAILSCALE_BE_CLI", "1").kill_on_drop(true).output();
         let out = tokio::time::timeout(WHOIS_TIMEOUT, fut)
             .await
             .map_err(|_| AuthError::Timeout { cmd: cmd.clone() })?
