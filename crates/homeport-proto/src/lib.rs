@@ -155,6 +155,12 @@ pub enum RequestBody {
         id: ItemId,
         max_pixels: u32,
     },
+    /// Answer: `LinkTarget`, or `Error { code: OutsideShare }` when the
+    /// target leaves the item's share. Appended last to keep the encoding of
+    /// earlier variants.
+    ReadLink {
+        id: ItemId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -238,6 +244,10 @@ pub enum Response {
     Error {
         code: ErrorCode,
         message: String,
+    },
+    /// A symlink's target, relative to the link's directory and inside its share.
+    LinkTarget {
+        target: String,
     },
 }
 

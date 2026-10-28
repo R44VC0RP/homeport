@@ -171,6 +171,7 @@ fn request_kind(b: &RequestBody) -> &'static str {
         RequestBody::Read { .. } => "read",
         RequestBody::Changes { .. } => "changes",
         RequestBody::Ping { .. } => "ping",
+        RequestBody::ReadLink { .. } => "readlink",
         _ => "unsupported",
     }
 }
@@ -252,6 +253,11 @@ async fn dispatch(ctx: &Conn, send: &mut SendStream, body: RequestBody) -> Resul
             changes(index, send, client, since_seq, index_id, follow).await
         }
         RequestBody::Ping { nonce } => write(send, &Response::Pong { nonce }).await,
+        RequestBody::ReadLink { id } => {
+            let idx = index.clone();
+            let target = tokio::task::spawn_blocking(move || idx.read_link(&id)).await??;
+            write(send, &Response::LinkTarget { target }).await
+        }
         RequestBody::Write { .. }
         | RequestBody::Create { .. }
         | RequestBody::Rename { .. }

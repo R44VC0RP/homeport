@@ -535,6 +535,54 @@ impl Index {
         Ok((fd, u64::try_from(st.st_size).unwrap_or(0), name, content_rev))
     }
 
+    /// A symlink's target as a path relative to the link's directory, which
+    /// must resolve (lexically) inside the link's share.
+    pub fn read_link(&self, id: &str) -> Result<String, IndexError> {
+        let Target::Path { path, share } = self.resolve(id)? else { return Err(IndexError::NotFound) };
+        let target = std::fs::read_link(&path).map_err(|e| match e.raw_os_error() {
+            Some(libc::EINVAL) => IndexError::NotFound,
+            _ => IndexError::from_io(e),
+        })?;
+        let dir = path.parent().ok_or(IndexError::OutsideShare)?;
+        let root = &self.shares[share].path;
+        let rel_dir = dir.strip_prefix(root).map_err(|_| IndexError::OutsideShare)?;
+        // The target's components relative to the share root.
+        let mut stack: Vec<std::ffi::OsString> = Vec::new();
+        let rest = if target.is_absolute() {
+            target.strip_prefix(root).map_err(|_| IndexError::OutsideShare)?.to_path_buf()
+        } else {
+            stack.extend(rel_dir.components().map(|c| c.as_os_str().to_owned()));
+            target.clone()
+        };
+        for c in rest.components() {
+            match c {
+                std::path::Component::Normal(n) => stack.push(n.to_owned()),
+                std::path::Component::ParentDir => {
+                    stack.pop().ok_or(IndexError::OutsideShare)?;
+                }
+                std::path::Component::CurDir => {}
+                _ => return Err(IndexError::OutsideShare),
+            }
+        }
+        if !target.is_absolute() {
+            return Ok(target.to_string_lossy().into_owned());
+        }
+        // Absolute inside the share: rewrite relative to the link's directory.
+        let depth = rel_dir.components().count();
+        let mut out = PathBuf::new();
+        let common = rel_dir.components().zip(stack.iter()).take_while(|(a, b)| a.as_os_str() == b.as_os_str()).count();
+        for _ in common..depth {
+            out.push("..");
+        }
+        for c in &stack[common..] {
+            out.push(c);
+        }
+        if out.as_os_str().is_empty() {
+            out.push(".");
+        }
+        Ok(out.to_string_lossy().into_owned())
+    }
+
     /// Filters a change set to the directories `client` has listed. A
     /// tombstone for an item that moved to another listed directory is
     /// dropped: the client sees the move as a change of parent.

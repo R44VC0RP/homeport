@@ -459,6 +459,16 @@ impl Client {
         }
     }
 
+    /// A symlink's target, relative to its directory and inside its share
+    /// (`Server { code: OutsideShare }` otherwise).
+    pub async fn read_link(&self, id: &str, priority: Priority) -> Result<String> {
+        let mut resp = self.request(priority, RequestBody::ReadLink { id: id.to_owned() }).await?;
+        match resp.next().await? {
+            Response::LinkTarget { target } => Ok(target),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Streams file content. Dropping the stream cancels the transfer.
     pub async fn read_stream(
         &self,
