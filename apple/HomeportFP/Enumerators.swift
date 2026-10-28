@@ -72,7 +72,7 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
                 let raw = try core.page(dirId: dirId, offset: offset, limit: limit)
                 let shareRoots = dirId == ItemID.serverRoot
                 let offline = shareRoots ? ext.isOffline : nil
-                observer.didEnumerate(raw.map { Item($0, offline: offline) })
+                observer.didEnumerate(raw.map { self.ext.makeItem($0, offline: offline) })
                 observer.finishEnumerating(upTo: raw.count == Int(limit) ? PageCodec.encode(offset + limit) : nil)
                 // A first listing: its small files (or, for a folder without
                 // any, a neighbour's) also cut fileproviderd's hold short.
@@ -113,7 +113,7 @@ final class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
         do {
             let raw = try core.workingSetPage(offset: offset, limit: limit)
             let offline = ext.isOffline
-            observer.didEnumerate(raw.map { Item($0, offline: $0.parentId == ItemID.serverRoot ? offline : nil) })
+            observer.didEnumerate(raw.map { ext.makeItem($0, offline: $0.parentId == ItemID.serverRoot ? offline : nil) })
             observer.finishEnumerating(upTo: raw.count == Int(limit) ? PageCodec.encode(offset + limit) : nil)
         } catch {
             observer.finishEnumeratingWithError(fpError(error))
@@ -131,7 +131,7 @@ final class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
                 // The root items always come along: their version carries the
                 // link state, so the "Disconnected" decoration clears.
                 let changed = cs.changed.filter { $0.parentId != ItemID.serverRoot }
-                let updates = changed.map { Item($0) } + rootItems(offline: false)
+                let updates = changed.map { ext.makeItem($0) } + rootItems(offline: false)
                 for chunk in stride(from: 0, to: updates.count, by: 500) {
                     observer.didUpdate(Array(updates[chunk..<min(chunk + 500, updates.count)]))
                 }
@@ -155,7 +155,7 @@ final class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 
     private func rootItems(offline: Bool) -> [Item] {
         let shares = (try? core.page(dirId: ItemID.serverRoot, offset: 0, limit: 64)) ?? []
-        return [Item.root(offline: offline)] + shares.map { Item($0, offline: offline) }
+        return [ext.rootItem(offline: offline)] + shares.map { ext.makeItem($0, offline: offline) }
     }
 
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {

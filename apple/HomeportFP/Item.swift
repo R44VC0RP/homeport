@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 enum ItemID {
     static let serverRoot = "root"
-    /// Items moved to basebook's Trash from this Mac (Finder's Trash).
+    /// Items moved to the server's Trash from this Mac (Finder's Trash).
     static let serverTrash = "trash"
 
     static func server(_ id: NSFileProviderItemIdentifier) -> String? {
@@ -56,17 +56,20 @@ final class Item: NSObject, NSFileProviderItem, NSFileProviderItemDecorating {
     /// Root and share roots carry the link state as a decoration.
     let offline: Bool?
     let echo: ItemEcho?
+    /// What the item's server can do.
+    let caps: ServerCaps
 
-    init(_ raw: FfiItem, offline: Bool? = nil, echo: ItemEcho? = nil) {
+    init(_ raw: FfiItem, offline: Bool? = nil, echo: ItemEcho? = nil, caps: ServerCaps = .all) {
         self.raw = raw
         self.offline = offline
         self.echo = echo
+        self.caps = caps
     }
 
-    static func root(offline: Bool?) -> Item {
+    static func root(name: String, offline: Bool?) -> Item {
         Item(
             FfiItem(
-                id: ItemID.serverRoot, parentId: ItemID.serverRoot, name: HomeportConfig.domainDisplayName,
+                id: ItemID.serverRoot, parentId: ItemID.serverRoot, name: name,
                 kind: .dir, size: 0, mtimeNs: 0, ctimeNs: 0, mode: 0o555, rev: 1, contentRev: 1,
                 symlinkTarget: nil, crtimeNs: 0, flags: 0, tags: nil),
             offline: offline)
@@ -91,24 +94,30 @@ final class Item: NSObject, NSFileProviderItem, NSFileProviderItemDecorating {
         if raw.id == ItemID.serverRoot { return [.allowsReading, .allowsContentEnumerating] }
         if ItemID.isShareRoot(raw.id) { return [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems] }
         if raw.parentId == ItemID.serverTrash {
-            // Put Back, or delete from the Trash (it stays in basebook's Trash).
+            // Put Back, or delete from the Trash (it stays in the server's Trash).
             var c: NSFileProviderItemCapabilities = [.allowsReading, .allowsReparenting, .allowsDeleting]
             if raw.kind == .dir { c.insert(.allowsContentEnumerating) }
             return c
         }
-        let common: NSFileProviderItemCapabilities = [.allowsReading, .allowsRenaming, .allowsReparenting, .allowsTrashing, .allowsDeleting]
+        // Deletes go to the server's Trash; a server without one offers neither.
+        var common: NSFileProviderItemCapabilities = [.allowsReading, .allowsRenaming, .allowsReparenting]
+        if caps.contains(.trash) { common.formUnion([.allowsTrashing, .allowsDeleting]) }
         switch raw.kind {
         case .dir: return common.union([.allowsContentEnumerating, .allowsAddingSubItems])
-        case .file: return common.union(.allowsWriting)
+        case .file:
+            // Locked on the server (or a cloud placeholder it will not
+            // hydrate): no edits from here.
+            if raw.flags & (ItemFlags.readOnly | ItemFlags.cloudOnly) != 0 { return common }
+            return common.union(.allowsWriting)
         default: return common
         }
     }
 
     var fileSystemFlags: NSFileProviderFileSystemFlags {
         var f: NSFileProviderFileSystemFlags = [.userReadable]
-        if raw.mode & 0o200 != 0 { f.insert(.userWritable) }
+        if raw.mode & 0o200 != 0 && raw.flags & ItemFlags.readOnly == 0 { f.insert(.userWritable) }
         if raw.kind == .dir || raw.mode & 0o100 != 0 { f.insert(.userExecutable) }
-        if raw.flags & 0x8000 != 0 { f.insert(.hidden) }
+        if raw.flags & ItemFlags.hidden != 0 { f.insert(.hidden) }
         return f
     }
 
@@ -140,7 +149,7 @@ final class Item: NSObject, NSFileProviderItem, NSFileProviderItemDecorating {
 }
 
 /// Finder tags travel as the xattr `com.apple.metadata:_kMDItemUserTags` on
-/// basebook (a plist array of "Name" or "Name\nColor" strings) but as an
+/// the server (a plist array of "Name" or "Name\nColor" strings) but as an
 /// NSKeyedArchiver dictionary `{v: 1, t: [[Name, 1], ...]}` in
 /// NSFileProviderItem.tagData.
 enum TagCodec {

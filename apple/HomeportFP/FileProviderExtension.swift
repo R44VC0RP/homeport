@@ -29,6 +29,15 @@ func fpError(_ error: Error) -> NSError {
     case .Rejected(let msg):
         let underlying = NSError(domain: "dev.vogel.homeport", code: 1, userInfo: [NSLocalizedDescriptionKey: msg])
         return NSFileProviderError(.cannotSynchronize, userInfo: [NSUnderlyingErrorKey: underlying]) as NSError
+    case .CloudOnly(let msg):
+        return NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError, userInfo: [
+            NSLocalizedDescriptionKey: "This file is only in the cloud on the server, so the server can't send it.",
+            NSLocalizedRecoverySuggestionErrorKey: "Download it on the server first (for example \"Always Keep on This Device\" or \"Always keep on this device\" in OneDrive), then open it again.",
+            NSDebugDescriptionErrorKey: msg,
+        ])
+    case .Denied(let msg):
+        let underlying = NSError(domain: "dev.vogel.homeport", code: 2, userInfo: [NSLocalizedDescriptionKey: msg])
+        return NSFileProviderError(.notAuthenticated, userInfo: [NSUnderlyingErrorKey: underlying]) as NSError
     }
 }
 
@@ -55,11 +64,16 @@ private func contentRev(_ v: NSFileProviderItemVersion) -> UInt64? {
 }
 
 /// The metadata of `item` named by `fields`, for the server. `current` is
-/// the item as the server has it (its mode is the base for permission flags).
-private func serverMeta(_ item: NSFileProviderItem, fields: NSFileProviderItemFields, current: FfiItem?,
-                        isDir: Bool) -> FfiMeta {
+/// the item as the server has it (its mode is the base for permission
+/// flags). Fields the server cannot keep (`caps`) are left out.
+private func serverMeta(_ item: NSFileProviderItem, fields allFields: NSFileProviderItemFields, current: FfiItem?,
+                        isDir: Bool, caps: ServerCaps) -> FfiMeta {
+    var fields = allFields
+    if !caps.contains(.tags) { fields.remove(.tagData) }
+    if !caps.contains(.xattrs) { fields.remove(.extendedAttributes) }
+    if !caps.contains(.setCrtime) { fields.remove(.creationDate) }
     var m = FfiMeta(mtimeNs: nil, crtimeNs: nil, mode: nil, hidden: nil, setTags: false, tags: nil, xattrs: [:])
-    // A folder's modification time on basebook tracks its own changes;
+    // A folder's modification time on the server tracks its own changes;
     // the local one (changed by every create here) is not pushed.
     if !isDir, fields.contains(.contentModificationDate), let d = item.contentModificationDate ?? nil { m.mtimeNs = nanos(d) }
     if fields.contains(.creationDate), let d = item.creationDate ?? nil { m.crtimeNs = nanos(d) }
@@ -73,9 +87,9 @@ private func serverMeta(_ item: NSFileProviderItem, fields: NSFileProviderItemFi
             }
         }
         if f.contains(.userWritable) { mode |= 0o200 } else { mode &= ~UInt32(0o222) }
-        if mode != current?.mode { m.mode = mode }
+        if mode != current?.mode && caps.contains(.mode) { m.mode = mode }
         let hidden = f.contains(.hidden)
-        if hidden != ((current?.flags ?? 0) & 0x8000 != 0) { m.hidden = hidden }
+        if hidden != ((current?.flags ?? 0) & ItemFlags.hidden != 0) && caps.contains(.hidden) { m.hidden = hidden }
     }
     if fields.contains(.tagData) {
         m.setTags = true
@@ -104,6 +118,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     let domain: NSFileProviderDomain
     let manager: NSFileProviderManager?
     let core: Core?
+    /// The server this domain shows.
+    let server: ServerEntry?
 
     private let pathMonitor = NWPathMonitor()
     /// The physical path is neither expensive (cellular, hotspot) nor
@@ -115,18 +131,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
         self.manager = NSFileProviderManager(for: domain)
+        let server = ServerStore.load().first { $0.id == domain.identifier.rawValue }
         var core: Core?
-        if let cfg = HomeportConfig.load() {
+        if let server {
             do {
                 core = try Core(config: CoreConfig(
-                    server: cfg.server, fingerprint: cfg.fingerprint, clientId: cfg.clientId,
-                    cachePath: HomeportConfig.cacheURL?.path, requestDeadlineMs: 800, workerThreads: 2))
+                    server: server.address, fingerprint: server.fingerprint, clientId: server.clientId,
+                    cachePath: ServerStore.cacheURL(for: server)?.path, requestDeadlineMs: 800, workerThreads: 2))
             } catch {
                 log.error("core init failed: \(String(describing: error), privacy: .public)")
             }
         } else {
-            log.error("no config.json in the app group container; start Homeport.app")
+            log.error("no server for domain \(domain.identifier.rawValue, privacy: .public) in servers.json; start Homeport.app")
         }
+        self.server = server
         self.core = core
         super.init()
         pathMonitor.pathUpdateHandler = { [weak self] path in
@@ -137,7 +155,42 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             self.lock.unlock()
         }
         pathMonitor.start(queue: DispatchQueue(label: "dev.vogel.homeport.path"))
-        log.notice("extension started for domain \(domain.identifier.rawValue, privacy: .public)")
+        log.notice("extension started for domain \(domain.identifier.rawValue, privacy: .public) (\(server?.address ?? "no server", privacy: .public))")
+    }
+
+    /// The server's name, for messages.
+    var serverName: String { server?.name ?? domain.displayName }
+
+    private var capsChecked: (caps: ServerCaps, at: Date)?
+
+    /// What the server can do: from its latest Hello, else what the app
+    /// last stored, else everything (as 0.5 assumed).
+    var caps: ServerCaps {
+        lock.lock()
+        defer { lock.unlock() }
+        if let c = capsChecked, Date().timeIntervalSince(c.at) < 5 { return c.caps }
+        let caps = core?.serverInfo().map { ServerCaps(rawValue: $0.caps) } ?? server?.caps ?? .all
+        capsChecked = (caps, Date())
+        return caps
+    }
+
+    /// An item of this domain.
+    func makeItem(_ raw: FfiItem, offline: Bool? = nil, echo: ItemEcho? = nil) -> Item {
+        var raw = raw
+        if raw.name.isEmpty {
+            // The server names neither its root nor its trash container,
+            // and the system rejects (and crashes on) nameless items.
+            switch raw.id {
+            case ItemID.serverRoot: raw.name = serverName
+            case ItemID.serverTrash: raw.name = "Trash"
+            default: raw.name = raw.id
+            }
+        }
+        return Item(raw, offline: offline, echo: echo, caps: caps)
+    }
+
+    func rootItem(offline: Bool?) -> Item {
+        Item.root(name: serverName, offline: offline)
     }
 
     func invalidate() {
@@ -182,7 +235,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             return progress
         }
         if identifier == .rootContainer {
-            completionHandler(Item.root(offline: isOffline), nil)
+            completionHandler(rootItem(offline: isOffline), nil)
             return progress
         }
         guard let id = ItemID.server(identifier) else {
@@ -193,7 +246,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             do {
                 let raw = try await core.item(id: id)
                 let shareRoot = raw.parentId == ItemID.serverRoot
-                completionHandler(Item(raw, offline: shareRoot ? self.isOffline : nil), nil)
+                completionHandler(self.makeItem(raw, offline: shareRoot ? self.isOffline : nil), nil)
             } catch {
                 completionHandler(nil, fpError(error))
             }
@@ -412,7 +465,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 self.noteOutcome(nil)
                 log.notice("fetched \(id, privacy: .public) \(done.bytes) bytes in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
                 self.noteFetched(id, contentRev: done.contentRev)
-                completionHandler(url, Item(raw), nil)
+                completionHandler(url, self.makeItem(raw), nil)
                 self.prefetchNearby(dirId: raw.parentId, opened: id, request: request)
             } catch {
                 self.noteOutcome(error)
@@ -484,7 +537,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 raw.size = done.size
                 raw.contentRev = done.contentRev
                 if options.contains(.strictVersioning),
-                   requestedVersion.contentVersion != Item(raw).itemVersion.contentVersion {
+                   requestedVersion.contentVersion != self.makeItem(raw).itemVersion.contentVersion {
                     try? FileManager.default.removeItem(at: url)
                     throw NSFileProviderError(.versionNoLongerAvailable)
                 }
@@ -493,7 +546,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 self.noteOutcome(nil)
                 log.notice("fetched \(id, privacy: .public) range \(range.location)+\(range.length) in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
                 if len == 0 { self.noteFetched(id, contentRev: done.contentRev) }
-                completionHandler(url, Item(raw), range, [], nil)
+                completionHandler(url, self.makeItem(raw), range, [], nil)
                 if len == 0 { self.prefetchNearby(dirId: raw.parentId, opened: id, request: request) }
             } catch {
                 self.noteOutcome(error)
@@ -504,14 +557,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         return progress
     }
 
-    /// File types basebook's Quick Look makes useful thumbnails for (as in
+    /// File types the server's thumbnailer makes useful thumbnails for (as in
     /// homeportd's thumbs.rs); others keep their type icon without a request.
     private static let thumbnailExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "avif", "tif", "tiff", "bmp", "svg", "psd", "raw", "dng",
         "cr2", "nef", "arw", "mp4", "mov", "m4v", "mkv", "webm", "avi", "pdf", "key", "pages", "numbers", "usdz", "glb",
     ]
 
-    /// Thumbnails come from basebook, so Finder never downloads an image or
+    /// Thumbnails come from the server, so Finder never downloads an image or
     /// video just to draw its icon.
     func fetchThumbnails(for itemIdentifiers: [NSFileProviderItemIdentifier], requestedSize size: CGSize,
                          perThumbnailCompletionHandler: @escaping (NSFileProviderItemIdentifier, Data?, Error?) -> Void,
@@ -519,6 +572,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
         guard let core else {
             completionHandler(NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        guard caps.contains(.thumbnails) else {
+            // The server makes none: Finder keeps the type icons.
+            for identifier in itemIdentifiers { perThumbnailCompletionHandler(identifier, nil, nil) }
+            progress.completedUnitCount = progress.totalUnitCount
+            completionHandler(nil)
             return progress
         }
         // Icons rarely need more than 512 px, and smaller ones are made faster.
@@ -568,7 +628,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     private func collisionError(_ error: Error) -> NSError? {
         guard let e = error as? CoreError, case .Collision(let id) = e, let core,
               let existing = try? core.cachedItem(id: id) else { return nil }
-        return NSError.fileProviderErrorForCollision(with: Item(existing))
+        return NSError.fileProviderErrorForCollision(with: makeItem(existing))
     }
 
     func createItem(basedOn itemTemplate: NSFileProviderItem, fields: NSFileProviderItemFields, contents url: URL?,
@@ -599,12 +659,21 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         } else {
             kind = .file
         }
+        if kind == .symlink && !caps.contains(.symlinks) {
+            log.notice("create \(name, privacy: .public): \(self.serverName, privacy: .public) cannot make symlinks")
+            let underlying = NSError(domain: "dev.vogel.homeport", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "\(serverName) can't store symbolic links.",
+            ])
+            completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize, userInfo: [NSUnderlyingErrorKey: underlying]))
+            return progress
+        }
         let isPackage = kind == .dir && urlIsDir
         let size = (kind == .file ? url.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } : nil) ?? 0
         progress.totalUnitCount = Int64(max(size, 1))
         let token = CancelToken()
         progress.cancellationHandler = { token.cancel() }
-        let meta = serverMeta(itemTemplate, fields: fields, current: nil, isDir: kind == .dir)
+        let caps = self.caps
+        let meta = serverMeta(itemTemplate, fields: fields, current: nil, isDir: kind == .dir, caps: caps)
         let opId = itemTemplate.itemIdentifier.rawValue
         let echo = ItemEcho(from: itemTemplate)
         let started = Date()
@@ -617,13 +686,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     meta: meta, mayExist: options.contains(.mayAlreadyExist),
                     progress: ProgressForwarder(progress), cancel: token)
                 if isPackage, let url {
-                    try await self.uploadTree(url, into: raw.id, core: core, token: token)
+                    try await self.uploadTree(url, into: raw.id, core: core, token: token, caps: caps)
                     raw = try await core.item(id: raw.id)
                 }
                 progress.completedUnitCount = progress.totalUnitCount
                 self.noteOutcome(nil)
                 log.notice("created \(name, privacy: .public) (\(String(describing: kind), privacy: .public), \(size) bytes) as \(raw.id, privacy: .public) in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
-                completionHandler(Item(raw, echo: echo), [], false, nil)
+                completionHandler(self.makeItem(raw, echo: echo), [], false, nil)
             } catch {
                 self.noteOutcome(error)
                 if let c = self.collisionError(error) {
@@ -640,7 +709,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
 
     /// A package (an .app, .xcodeproj, .rtfd...) arrives as one item whose
     /// URL is a directory: its contents are uploaded here, item by item.
-    private func uploadTree(_ dir: URL, into parentId: String, core: Core, token: CancelToken) async throws {
+    private func uploadTree(_ dir: URL, into parentId: String, core: Core, token: CancelToken, caps: ServerCaps) async throws {
         let fm = FileManager.default
         for child in try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
             let name = child.lastPathComponent
@@ -648,18 +717,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             let v = try child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey])
             var meta = FfiMeta(mtimeNs: v.contentModificationDate.map(nanos), crtimeNs: nil, mode: nil, hidden: nil,
                                setTags: false, tags: nil, xattrs: [:])
-            if let attrs = try? fm.attributesOfItem(atPath: child.path), let p = attrs[.posixPermissions] as? NSNumber {
+            if caps.contains(.mode), let attrs = try? fm.attributesOfItem(atPath: child.path),
+               let p = attrs[.posixPermissions] as? NSNumber {
                 meta.mode = p.uint32Value
             }
             let op = "pkg-\(parentId)-\(name)"
             if v.isSymbolicLink == true {
+                guard caps.contains(.symlinks) else { continue }
                 let target = try fm.destinationOfSymbolicLink(atPath: child.path)
                 _ = try? await core.createItem(opId: op, parentId: parentId, name: name, kind: .symlink, contentPath: nil,
                                                linkTarget: target, meta: meta, mayExist: true, progress: nil, cancel: token)
             } else if v.isDirectory == true {
                 let d = try await core.createItem(opId: op, parentId: parentId, name: name, kind: .dir, contentPath: nil,
                                                   linkTarget: nil, meta: meta, mayExist: true, progress: nil, cancel: token)
-                try await uploadTree(child, into: d.id, core: core, token: token)
+                try await uploadTree(child, into: d.id, core: core, token: token, caps: caps)
             } else {
                 _ = try await core.createItem(opId: op, parentId: parentId, name: name, kind: .file, contentPath: child.path,
                                               linkTarget: nil, meta: meta, mayExist: true, progress: nil, cancel: token)
@@ -679,8 +750,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         let cached = try? core.cachedItem(id: id)
         if id == ItemID.serverRoot || ItemID.isShareRoot(id) {
             // Nothing about the root or the shares can change from here.
-            let raw = cached ?? Item.root(offline: nil).raw
-            completionHandler(Item(raw, echo: echo), [], false, nil)
+            let raw = cached ?? rootItem(offline: nil).raw
+            completionHandler(makeItem(raw, echo: echo), [], false, nil)
             return progress
         }
         let isDir = cached?.kind == .dir || (item.contentType ?? .data).conforms(to: .folder)
@@ -688,7 +759,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         let toTrash = changedFields.contains(.parentItemIdentifier) && item.parentItemIdentifier == .trashContainer
         let move = changedFields.contains(.parentItemIdentifier) || changedFields.contains(.filename)
         let contents = changedFields.contains(.contents) && newContents != nil
-        let meta = serverMeta(item, fields: changedFields, current: cached, isDir: isDir)
+        let caps = self.caps
+        let meta = serverMeta(item, fields: changedFields, current: cached, isDir: isDir, caps: caps)
         let size = newContents.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } ?? 0
         progress.totalUnitCount = Int64(max(size, 1))
         let token = CancelToken()
@@ -709,7 +781,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     let parent = changedFields.contains(.parentItemIdentifier) ? ItemID.server(item.parentItemIdentifier) : nil
                     let name = changedFields.contains(.filename) ? item.filename : nil
                     current = try await core.modifyItem(id: id, newParentId: parent, newName: name,
-                                                        meta: contents ? serverMeta(item, fields: [], current: cached, isDir: isDir) : meta)
+                                                        meta: contents ? serverMeta(item, fields: [], current: cached, isDir: isDir, caps: caps) : meta)
                     metaDone = !contents
                 }
                 if contents, let url = newContents, !inTrash && !toTrash {
@@ -732,7 +804,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 progress.completedUnitCount = progress.totalUnitCount
                 self.noteOutcome(nil)
                 log.notice("modified \(what, privacy: .public) (\(size) bytes) in \(Int(Date().timeIntervalSince(started) * 1000)) ms\(fetch ? " (conflict)" : "", privacy: .public)")
-                completionHandler(Item(raw, echo: echo), [], fetch, nil)
+                completionHandler(self.makeItem(raw, echo: echo), [], fetch, nil)
             } catch {
                 self.noteOutcome(error)
                 if let c = self.collisionError(error) {
@@ -747,9 +819,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         return progress
     }
 
-    /// Deletes never destroy anything on basebook: an item deleted here
-    /// moves to basebook's Trash, and emptying this Mac's Trash only drops
-    /// the items from the trash container (they stay in basebook's Trash).
+    /// Deletes never destroy anything on the server: an item deleted here
+    /// moves to the server's Trash, and emptying this Mac's Trash only drops
+    /// the items from the trash container (they stay in the server's Trash).
+    /// A server without a Trash refuses deletes (its items do not offer them).
     func deleteItem(identifier: NSFileProviderItemIdentifier, baseVersion version: NSFileProviderItemVersion,
                     options: NSFileProviderDeleteItemOptions = [], request: NSFileProviderRequest,
                     completionHandler: @escaping (Error?) -> Void) -> Progress {
@@ -771,7 +844,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     _ = try await core.trashItem(id: id, listed: false, recursive: options.contains(.recursive))
                 }
                 self.noteOutcome(nil)
-                log.notice("deleted \(id, privacy: .public) (\(inTrash ? "left in basebook's Trash" : "moved to basebook's Trash", privacy: .public))")
+                log.notice("deleted \(id, privacy: .public) (\(inTrash ? "left in the server's Trash" : "moved to the server's Trash", privacy: .public))")
                 completionHandler(nil)
             } catch CoreError.NotFound {
                 completionHandler(nil)
