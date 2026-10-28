@@ -6,16 +6,16 @@
 
 mod fs;
 mod tags;
+mod watch;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub use fs::{Dir, File, Fs, Volume};
+pub use watch::Watcher;
 
-use tokio::sync::mpsc;
-
-use super::{ServiceOps, SysOps, ThumbnailerOps, TrashOps, WatchBatch, WatcherOps, unix, unsupported};
+use super::{ServiceOps, SysOps, ThumbnailerOps, TrashOps, unix, unsupported};
 
 /// Process plumbing.
 pub struct Sys;
@@ -76,30 +76,6 @@ impl SysOps for Sys {
     fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         unix::write_private(path, bytes)
     }
-}
-
-/// inotify on indexed directories only.
-pub struct Watcher;
-
-impl WatcherOps for Watcher {
-    /// One inotify fd and a reader thread. Ignore `cursor` (there is none):
-    /// send `Change::All` once so every indexed directory is rescanned and
-    /// diffed against the index. Check `/proc/sys/fs/inotify/max_user_watches`
-    /// and log headroom.
-    fn start(_roots: &[PathBuf], _cursor: Option<&str>, _tx: mpsc::UnboundedSender<WatchBatch>) -> io::Result<Self> {
-        Err(unsupported("watching"))
-    }
-
-    /// `inotify_add_watch(path, IN_CREATE|IN_DELETE|IN_MOVED_FROM|IN_MOVED_TO|
-    /// IN_CLOSE_WRITE|IN_ATTRIB|IN_MODIFY|IN_DELETE_SELF|IN_MOVE_SELF|
-    /// IN_ONLYDIR|IN_EXCL_UNLINK)`, then send `Change::Path(path)` (the
-    /// create-then-watch race). Events map to `Change::Path(dir/name)`;
-    /// coalesce IN_MODIFY per ~100 ms; `IN_Q_OVERFLOW` → `Change::All`;
-    /// `IN_IGNORED`/`IN_DELETE_SELF`/`IN_UNMOUNT` → `Change::Path(dir)`.
-    fn watch_dir(&self, _path: &Path) {}
-
-    /// `inotify_rm_watch`.
-    fn unwatch_dir(&self, _path: &Path) {}
 }
 
 /// freedesktop.org Trash.
