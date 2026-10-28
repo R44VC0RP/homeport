@@ -4,9 +4,11 @@
 //!   from the request class.
 //! - Identical concurrent `list_dir` and `read_range` calls share one request;
 //!   the request is cancelled (its stream reset) when every caller drops it.
-//! - Every request has a deadline. When the link is Offline, or the server
-//!   does not answer within the deadline, calls fail with
-//!   [`Error::Unreachable`] instead of waiting.
+//! - Every request has a progress deadline: it fails with
+//!   [`Error::Unreachable`] when no response bytes arrive for the deadline
+//!   (stretched with the link's RTT), not when a whole response takes long,
+//!   so big frames on slow links still arrive. When the link is Offline,
+//!   calls fail at once and in-flight ones are abandoned.
 
 mod link;
 mod tls;
@@ -25,7 +27,7 @@ use homeport_proto::{
 use quinn::{Connection, Endpoint, RecvStream};
 use tokio::sync::Notify;
 
-pub use link::{LinkConfig, LinkEstimator, LinkSnapshot, LinkState};
+pub use link::{LinkConfig, LinkEstimator, LinkSnapshot, LinkState, Sample};
 pub use tls::parse_fingerprint;
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -77,13 +79,54 @@ pub struct Config {
     pub server: SocketAddr,
     pub fingerprint: [u8; 32],
     pub client_id: String,
-    /// Time allowed for the first response frame (and between frames).
+    /// Time allowed without response bytes (before the first and between
+    /// any two), on fast links; stretched to ~3 RTT on slow ones.
     pub request_deadline: Duration,
     pub connect_timeout: Duration,
     pub ping_interval: Duration,
     pub idle_ping_interval: Duration,
+    /// Ping timeout on fast links; stretched like `request_deadline`.
     pub ping_timeout: Duration,
     pub link: LinkConfig,
+    /// Congestion controller for what this client sends (uploads).
+    pub congestion: Congestion,
+}
+
+/// QUIC congestion controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Congestion {
+    Bbr,
+    Cubic,
+    NewReno,
+}
+
+impl Congestion {
+    /// `HOMEPORT_CC` (`bbr`, `cubic` or `newreno`), else the default.
+    pub fn from_env() -> Self {
+        std::env::var("HOMEPORT_CC").ok().and_then(|v| v.parse().ok()).unwrap_or(Self::DEFAULT)
+    }
+
+    pub const DEFAULT: Self = Self::Bbr;
+
+    pub fn factory(self) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+        match self {
+            Self::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+            Self::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+            Self::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        }
+    }
+}
+
+impl std::str::FromStr for Congestion {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "bbr" => Ok(Self::Bbr),
+            "cubic" => Ok(Self::Cubic),
+            "newreno" | "reno" => Ok(Self::NewReno),
+            _ => Err(format!("unknown congestion controller {s:?}; use bbr, cubic or newreno")),
+        }
+    }
 }
 
 impl Config {
@@ -98,6 +141,7 @@ impl Config {
             idle_ping_interval: Duration::from_secs(30),
             ping_timeout: Duration::from_secs(1),
             link: LinkConfig::default(),
+            congestion: Congestion::from_env(),
         }
     }
 }
@@ -156,12 +200,14 @@ struct Inner {
     probe_now: Arc<Notify>,
     list_flights: Mutex<HashMap<ListKey, WeakShared<ListFuture>>>,
     read_flights: Mutex<HashMap<ReadKey, WeakShared<ReadFuture>>>,
-    pinger: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Read streams moving bulk data: `(count, busy since)`.
+    transfers: Mutex<(usize, Option<Instant>)>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if let Some(h) = lock(&self.pinger).take() {
+        for h in lock(&self.tasks).drain(..) {
             h.abort();
         }
         self.endpoint.close(quinn::VarInt::from_u32(0), b"client dropped");
@@ -172,8 +218,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn transport_config() -> quinn::TransportConfig {
+fn transport_config(cc: Congestion) -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
+    t.congestion_controller_factory(cc.factory());
     t.initial_mtu(1200);
     let mut mtu = quinn::MtuDiscoveryConfig::default();
     mtu.upper_bound(1232);
@@ -196,37 +243,97 @@ pub struct Client {
 /// An in-flight response stream.
 pub struct Responses {
     recv: RecvStream,
+    /// Progress deadline on fast links (`None`: wait as long as it takes).
     deadline: Option<Duration>,
+    /// Give up as soon as the link counts as offline (not for probes, which
+    /// are how it stops counting as offline).
+    abandon_offline: bool,
     inner: Arc<Inner>,
 }
 
+/// Other streams' data the connection must receive in one deadline for a
+/// silent stream to keep waiting (it is queued behind more urgent ones).
+const BUSY_ELSEWHERE: u64 = 8 * 1024;
+/// While the server still sends something (acks of resent packets on a
+/// lossy link), a silent stream waits up to this many deadlines.
+const ALIVE_DEADLINES: u32 = 3;
+
 impl Responses {
+    /// Reads some bytes; `None` at the end of the stream. Fails when no
+    /// bytes arrive within the (RTT-scaled) deadline, unless the connection
+    /// is receiving other streams' data (this one is queued behind them) or,
+    /// for up to [`ALIVE_DEADLINES`], anything at all from the server; and
+    /// at once when the link counts as offline.
+    async fn read_some(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
+        let read = |r: Result<Option<usize>, quinn::ReadError>| r.map_err(|e| Error::Unreachable(e.to_string()));
+        let Some(base) = self.deadline else { return read(self.recv.read(buf).await) };
+        let inner = &self.inner;
+        let fut = self.recv.read(buf);
+        tokio::pin!(fut);
+        // Data already buffered: no timers (the common case mid-transfer).
+        if let Some(r) = (&mut fut).now_or_never() {
+            return read(r);
+        }
+        let scaled = |base| if self.abandon_offline { inner.scaled(base) } else { inner.scaled_probe(base) };
+        let limit = scaled(base);
+        let started = Instant::now();
+        let mut until = started + limit;
+        let mut rx_mark = None;
+        loop {
+            let tick = until.saturating_duration_since(Instant::now()).min(Duration::from_millis(250));
+            tokio::select! {
+                r = &mut fut => return read(r),
+                _ = tokio::time::sleep(tick) => {}
+            }
+            if self.abandon_offline && lock(&inner.link).fail_fast() {
+                return Err(Error::Unreachable("link went offline".into()));
+            }
+            let rx = inner.rx();
+            let mark = *rx_mark.get_or_insert(rx);
+            if Instant::now() < until {
+                continue;
+            }
+            let busy = rx.0.saturating_sub(mark.0) >= BUSY_ELSEWHERE;
+            let alive = rx.1 > mark.1 && started.elapsed() < limit * ALIVE_DEADLINES;
+            if busy || alive {
+                rx_mark = Some(rx);
+                until = Instant::now() + scaled(base);
+                continue;
+            }
+            inner.probe_now.notify_one();
+            return Err(Error::Unreachable(format!("no response for {} ms", limit.as_millis())));
+        }
+    }
+
+    /// Fills `buf`; `false` when the stream ended before its first byte.
+    async fn read_full(&mut self, buf: &mut [u8]) -> Result<bool> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.read_some(&mut buf[filled..]).await? {
+                Some(n) => filled += n,
+                None if filled == 0 => return Ok(false),
+                None => return Err(Error::Protocol("stream ended mid-frame".into())),
+            }
+        }
+        Ok(true)
+    }
+
     async fn read_frame(&mut self) -> Result<Option<Response>> {
         let mut prefix = [0u8; 4];
-        match self.recv.read_exact(&mut prefix).await {
-            Ok(()) => {}
-            Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        if !self.read_full(&mut prefix).await? {
+            return Ok(None);
         }
         let len = proto::check_len(prefix)?;
         let mut buf = vec![0u8; len];
-        self.recv.read_exact(&mut buf).await?;
+        if len > 0 && !self.read_full(&mut buf).await? {
+            return Err(Error::Protocol("stream ended mid-frame".into()));
+        }
         Ok(Some(proto::decode(&buf)?))
     }
 
     /// Next response frame; errors on server `Error` frames and on end of stream.
     pub async fn next(&mut self) -> Result<Response> {
-        let frame = match self.deadline {
-            Some(d) => match tokio::time::timeout(d, self.read_frame()).await {
-                Ok(r) => r,
-                Err(_) => {
-                    self.inner.probe_now.notify_one();
-                    return Err(Error::Unreachable(format!("no response within {} ms", d.as_millis())));
-                }
-            },
-            None => self.read_frame().await,
-        }?;
-        match frame {
+        match self.read_frame().await? {
             Some(Response::Error { code, message }) => Err(Error::Server { code, message }),
             Some(Response::Collision { existing }) => Err(Error::Collision(Box::new(existing))),
             Some(r) => Ok(r),
@@ -242,12 +349,40 @@ impl Responses {
 /// Streaming file content.
 pub struct ReadStream {
     resp: Responses,
-    started: Instant,
     wire: u64,
     done: Option<(u64, u64, u64)>,
+    /// Counted as a running transfer (for the throughput estimate).
+    counted: bool,
 }
 
+/// A read counts as a transfer for the throughput estimate once it has
+/// moved this much (small reads say little about the link's rate).
+const TRANSFER_MIN: u64 = 64 * 1024;
+
 impl ReadStream {
+    fn new(resp: Responses) -> Self {
+        Self { resp, wire: 0, done: None, counted: false }
+    }
+
+    fn set_counted(&mut self, on: bool) {
+        if self.counted == on {
+            return;
+        }
+        self.counted = on;
+        let mut t = lock(&self.resp.inner.transfers);
+        if on {
+            t.0 += 1;
+            if t.0 == 1 {
+                t.1 = Some(Instant::now());
+            }
+        } else {
+            t.0 = t.0.saturating_sub(1);
+            if t.0 == 0 {
+                t.1 = None;
+            }
+        }
+    }
+
     /// Next `(offset, bytes)` chunk, or `None` at the end.
     pub async fn next_chunk(&mut self) -> Result<Option<(u64, Bytes)>> {
         if self.done.is_some() {
@@ -256,6 +391,9 @@ impl ReadStream {
         match self.resp.next().await? {
             Response::Data { offset, compressed, raw_len, bytes } => {
                 self.wire += bytes.len() as u64;
+                if self.wire >= TRANSFER_MIN {
+                    self.set_counted(true);
+                }
                 let data = if compressed {
                     zstd::bulk::decompress(&bytes, raw_len as usize)
                         .map_err(|e| Error::Protocol(format!("zstd: {e}")))?
@@ -266,7 +404,7 @@ impl ReadStream {
             }
             Response::DataEnd { total, size, content_rev } => {
                 self.done = Some((total, size, content_rev));
-                lock(&self.resp.inner.link).on_transfer(Instant::now(), self.wire, self.started.elapsed());
+                self.set_counted(false);
                 Ok(None)
             }
             other => Err(unexpected(&other)),
@@ -280,6 +418,12 @@ impl ReadStream {
 
     pub fn wire_bytes(&self) -> u64 {
         self.wire
+    }
+}
+
+impl Drop for ReadStream {
+    fn drop(&mut self) {
+        self.set_counted(false);
     }
 }
 
@@ -337,7 +481,7 @@ impl Client {
             return Err(Error::Unreachable("link is offline".into()));
         }
         let frame = proto::encode_frame(&Request { priority, body })?;
-        let budget = inner.cfg.request_deadline.max(Duration::from_secs(2));
+        let budget = inner.scaled(inner.cfg.request_deadline.max(Duration::from_secs(2)));
         let open = async {
             let conn = inner.connection(budget).await?;
             let (mut send, recv) = conn.open_bi().await?;
@@ -353,7 +497,6 @@ impl Client {
             }
         };
         if let Some(up) = upload {
-            let started = Instant::now();
             let mut file = up.file;
             let mut buf = vec![0u8; UPLOAD_CHUNK];
             let mut sent: u64 = 0;
@@ -379,11 +522,10 @@ impl Client {
                 sent += n as u64;
                 (up.progress)(sent);
             }
-            lock(&inner.link).on_transfer(Instant::now(), sent, started.elapsed());
         }
         send.finish().ok();
         let link = inner.clone();
-        let mut resp = Responses { recv, deadline: Some(WRITE_DEADLINE), inner };
+        let mut resp = Responses { recv, deadline: Some(WRITE_DEADLINE), abandon_offline: true, inner };
         // The server may take a while (fsync, a busy folder), but once the
         // link counts as offline the answer is not coming: fail now so the
         // system queues the change and retries after reconnecting.
@@ -512,7 +654,7 @@ impl Client {
         let crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|e| Error::Config(e.to_string()))?;
         let mut qc = quinn::ClientConfig::new(Arc::new(crypto));
-        qc.transport_config(Arc::new(transport_config()));
+        qc.transport_config(Arc::new(transport_config(cfg.congestion)));
         let bind: SocketAddr = if cfg.server.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
         let mut endpoint = Endpoint::client(bind).map_err(|e| Error::Config(format!("bind UDP socket: {e}")))?;
         endpoint.set_default_client_config(qc);
@@ -527,10 +669,12 @@ impl Client {
             probe_now: Arc::new(Notify::new()),
             list_flights: Mutex::new(HashMap::new()),
             read_flights: Mutex::new(HashMap::new()),
-            pinger: Mutex::new(None),
+            tasks: Mutex::new(Vec::new()),
+            transfers: Mutex::new((0, None)),
         });
-        let handle = tokio::spawn(ping_loop(Arc::downgrade(&inner), inner.probe_now.clone()));
-        *lock(&inner.pinger) = Some(handle);
+        let pinger = tokio::spawn(ping_loop(Arc::downgrade(&inner), inner.probe_now.clone()));
+        let sampler = tokio::spawn(sample_loop(Arc::downgrade(&inner)));
+        lock(&inner.tasks).extend([pinger, sampler]);
         Ok(Self { inner })
     }
 
@@ -561,6 +705,11 @@ impl Client {
     /// Sends one app-level ping and feeds the link estimator.
     pub async fn ping(&self) -> Result<Duration> {
         self.inner.probe().await
+    }
+
+    /// Asks the background prober to check the link now.
+    pub fn probe_soon(&self) {
+        self.inner.probe_now.notify_one();
     }
 
     async fn request(&self, priority: Priority, body: RequestBody) -> Result<Responses> {
@@ -672,14 +821,14 @@ impl Client {
     ) -> Result<ReadStream> {
         let body = RequestBody::Read { id: id.to_owned(), offset, len, compress };
         let resp = self.request(priority, body).await?;
-        Ok(ReadStream { resp, started: Instant::now(), wire: 0, done: None })
+        Ok(ReadStream::new(resp))
     }
 
     /// A PNG thumbnail made on the server; empty when it has none for the file.
     pub async fn thumbnail(&self, id: &str, max_pixels: u32) -> Result<Bytes> {
         let body = RequestBody::Thumbnail { id: id.to_owned(), max_pixels };
         let resp = self.request(Priority::Thumbnail, body).await?;
-        let mut s = ReadStream { resp, started: Instant::now(), wire: 0, done: None };
+        let mut s = ReadStream::new(resp);
         let mut buf = BytesMut::new();
         while let Some((_, chunk)) = s.next_chunk().await? {
             buf.extend_from_slice(&chunk);
@@ -755,6 +904,24 @@ impl Client {
 }
 
 impl Inner {
+    /// Request deadline `base`, stretched for the link's round trip.
+    fn scaled(&self, base: Duration) -> Duration {
+        lock(&self.link).request_timeout(base)
+    }
+
+    /// Probe deadline `base`, stretched for the link's round trip.
+    fn scaled_probe(&self, base: Duration) -> Duration {
+        lock(&self.link).probe_timeout(base)
+    }
+
+    /// Bytes and datagrams the current connection has received.
+    fn rx(&self) -> (u64, u64) {
+        lock(&self.conn).as_ref().map_or((0, 0), |c| {
+            let rx = c.stats().udp_rx;
+            (rx.bytes, rx.datagrams)
+        })
+    }
+
     fn live_conn(&self) -> Option<Connection> {
         let mut g = lock(&self.conn);
         match g.as_ref() {
@@ -788,7 +955,7 @@ impl Inner {
         let hello = RequestBody::Hello { protocol: proto::PROTOCOL_VERSION, client_id: self.cfg.client_id.clone() };
         send.write_all(&proto::encode_frame(&Request { priority: Priority::UserOpen, body: hello })?).await?;
         send.finish().ok();
-        let mut resp = Responses { recv, deadline: Some(wait), inner: self.clone() };
+        let mut resp = Responses { recv, deadline: Some(wait), abandon_offline: false, inner: self.clone() };
         match resp.next().await? {
             Response::Hello { index_id, seq, roots, server, .. } => {
                 let prev = lock(&self.hello).replace(HelloInfo { index_id, seq, roots, server });
@@ -807,6 +974,9 @@ impl Inner {
         if !probe {
             *lock(&self.last_activity) = Instant::now();
             if lock(&self.link).fail_fast() {
+                // Someone wants the server: check whether it is back now
+                // rather than at the next scheduled probe.
+                self.probe_now.notify_one();
                 return Err(Error::Unreachable("link is offline".into()));
             }
         }
@@ -814,7 +984,8 @@ impl Inner {
         let frame = proto::encode_frame(&Request { priority, body })?;
         // A request never waits longer than its deadline, even to reconnect;
         // probes may take the full connect timeout.
-        let budget = if probe { self.cfg.connect_timeout } else { deadline };
+        let budget =
+            if probe { self.cfg.connect_timeout.max(self.scaled_probe(deadline)) } else { self.scaled(deadline) };
         let open = async {
             let conn = self.connection(budget).await?;
             let (mut send, recv) = conn.open_bi().await?;
@@ -830,7 +1001,7 @@ impl Inner {
                 return Err(Error::Unreachable(format!("no connection within {} ms", budget.as_millis())));
             }
         };
-        Ok(Responses { recv, deadline: Some(deadline), inner: self })
+        Ok(Responses { recv, deadline: Some(deadline), abandon_offline: !probe, inner: self })
     }
 
     async fn probe(self: &Arc<Self>) -> Result<Duration> {
@@ -843,18 +1014,14 @@ impl Inner {
                 other => Err(unexpected(&other)),
             }
         };
-        let result = tokio::time::timeout(self.cfg.ping_timeout + self.cfg.connect_timeout, result)
+        let limit = self.scaled_probe(self.cfg.ping_timeout) + self.cfg.connect_timeout;
+        let result = tokio::time::timeout(limit, result)
             .await
             .unwrap_or_else(|_| Err(Error::Unreachable("ping timed out".into())));
-        let conn = self.live_conn();
         let mut link = lock(&self.link);
-        match (&result, conn) {
-            (Ok(rtt), Some(c)) => {
-                let s = c.stats();
-                link.on_probe_ok(Instant::now(), *rtt, Some(c.rtt()), (s.path.sent_packets, s.path.lost_packets));
-            }
-            (Ok(rtt), None) => link.on_probe_ok(Instant::now(), *rtt, None, (0, 0)),
-            (Err(_), _) => link.on_probe_miss(),
+        match &result {
+            Ok(rtt) => link.on_probe_ok(Instant::now(), *rtt),
+            Err(_) => link.on_probe_miss(),
         }
         result
     }
@@ -876,12 +1043,36 @@ async fn ping_loop(inner: Weak<Inner>, probe_now: Arc<Notify>) {
         let ok = i.probe().await.is_ok();
         let state = lock(&i.link).state();
         let idle = lock(&i.last_activity).elapsed() > Duration::from_secs(60);
-        next = if !ok || state == LinkState::Offline {
-            Duration::from_secs(2)
+        next = if state == LinkState::Offline {
+            Duration::from_secs(1)
+        } else if !ok {
+            // Confirm (or clear) a miss at once rather than in seconds.
+            Duration::ZERO
         } else if idle {
             i.cfg.idle_ping_interval
         } else {
             i.cfg.ping_interval
         };
+    }
+}
+
+/// Feeds the link estimator connection samples (RTT, loss, delivered bytes).
+async fn sample_loop(inner: Weak<Inner>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(i) = inner.upgrade() else { return };
+        let Some(c) = i.live_conn() else { continue };
+        let s = c.stats();
+        let busy_since = lock(&i.transfers).1;
+        let sample = Sample {
+            rtt: c.rtt(),
+            sent_packets: s.path.sent_packets,
+            lost_packets: s.path.lost_packets,
+            rx_bytes: s.udp_rx.bytes,
+            busy_since,
+        };
+        lock(&i.link).on_sample(Instant::now(), sample);
     }
 }

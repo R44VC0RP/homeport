@@ -5,6 +5,7 @@
 
 mod auth;
 mod config;
+mod congestion;
 mod db;
 mod index;
 mod names;

@@ -12,6 +12,8 @@ bytes.workspace = true
 clap.workspace = true
 lru.workspace = true
 quinn.workspace = true
+# RttEstimator, for the congestion controller wrapper.
+quinn-proto.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 rusqlite.workspace = true
