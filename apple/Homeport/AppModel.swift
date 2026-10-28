@@ -34,7 +34,9 @@ final class AppModel: ObservableObject {
         let d = NSFileProviderDomain(
             identifier: NSFileProviderDomainIdentifier(HomeportConfig.domainIdentifier),
             displayName: HomeportConfig.domainDisplayName)
-        d.supportsSyncingTrash = false
+        // Finder's Move to Trash becomes a move into the trash container,
+        // which homeportd maps to basebook's Trash (and Put Back out of it).
+        d.supportsSyncingTrash = true
         return d
     }()
 
@@ -117,6 +119,23 @@ final class AppModel: ObservableObject {
     }
 
     func addDomain() {
+        let domain = self.domain
+        NSFileProviderManager.getDomainsWithCompletionHandler { domains, _ in
+            // A domain added before trash syncing keeps its old setting:
+            // re-add it (nothing is lost; until 0.4 nothing could be changed locally).
+            if let old = domains.first(where: { $0.identifier == domain.identifier }), !old.supportsSyncingTrash {
+                log.notice("re-adding the domain to turn on trash syncing")
+                NSFileProviderManager.remove(old, mode: .preserveDirtyUserData) { _, error in
+                    if let error { log.error("remove domain: \(String(describing: error), privacy: .public)") }
+                    Task { @MainActor in self.add(domain) }
+                }
+                return
+            }
+            Task { @MainActor in self.add(domain) }
+        }
+    }
+
+    private func add(_ domain: NSFileProviderDomain) {
         NSFileProviderManager.add(domain) { error in
             Task { @MainActor in
                 if let error {
