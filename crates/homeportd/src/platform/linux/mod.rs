@@ -5,21 +5,22 @@
 //! with the `image` crate and `ffmpeg`, and a systemd user unit.
 
 mod fs;
+mod service;
 mod tags;
 mod thumbs;
 mod trash;
 mod watch;
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub use fs::{Dir, File, Fs, Volume};
+pub use service::Service;
 pub use thumbs::Thumbnailer;
 pub use trash::Trash;
 pub use watch::Watcher;
 
-use super::{ServiceOps, SysOps, unix, unsupported};
+use super::{SysOps, unix};
 
 /// Process plumbing.
 pub struct Sys;
@@ -79,30 +80,5 @@ impl SysOps for Sys {
 
     fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         unix::write_private(path, bytes)
-    }
-}
-
-/// systemd user unit.
-pub struct Service;
-
-impl ServiceOps for Service {
-    /// Write `~/.config/systemd/user/homeportd.service` (`ExecStart=exe args`,
-    /// `Restart=always`, `RestartSec=5`, `Type=simple` or `notify` with
-    /// `sd-notify`), `systemctl --user daemon-reload`, `enable --now`, and
-    /// tell the user to run `loginctl enable-linger $USER` so it runs without
-    /// a login. With `print`, return the unit text only. Also suggest the
-    /// `net.core.rmem_max/wmem_max=7500000` sysctl for QUIC.
-    fn install(_exe: &Path, _args: &[OsString], _print: bool) -> io::Result<String> {
-        Err(unsupported("service install"))
-    }
-
-    /// `systemctl --user disable --now homeportd`, remove the unit, daemon-reload.
-    fn uninstall() -> io::Result<String> {
-        Err(unsupported("service uninstall"))
-    }
-
-    /// `systemctl --user show homeportd -p ActiveState,SubState,MainPID`.
-    fn status() -> io::Result<String> {
-        Err(unsupported("service status"))
     }
 }
