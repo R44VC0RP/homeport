@@ -25,6 +25,9 @@ pub struct BenchArgs {
     /// File to read for throughput; defaults to the largest file (≤ 1 GiB) in `--big`.
     #[arg(long)]
     read: Option<String>,
+    /// Stop each throughput read after this many seconds (slow links).
+    #[arg(long, default_value_t = 30)]
+    read_secs: u64,
 }
 
 struct Stats(Vec<Duration>);
@@ -164,6 +167,9 @@ pub async fn run(c: &Client, a: BenchArgs, out: &mut impl Write) -> Result<(), C
         let mut n = 0u64;
         while let Some((_, chunk)) = s.next_chunk().await? {
             n += chunk.len() as u64;
+            if t.elapsed() > Duration::from_secs(a.read_secs) {
+                break;
+            }
         }
         let secs = t.elapsed().as_secs_f64();
         writeln!(
