@@ -5,12 +5,15 @@ name: Release
 # after the tag. The maintainer then uploads the notarized Homeport.app
 # (scripts/release-app.sh <tag>) and publishes the draft.
 #
-# Run it by hand (workflow_dispatch) to build the archives as workflow
-# artifacts without creating a release.
+# Run it by hand (workflow_dispatch), or change the release build in a PR, to
+# build the archives as workflow artifacts without creating a release.
 
 on:
   push:
     tags: ["v*"]
+  # Changes to the release build are built (not released) on their PR.
+  pull_request:
+    paths: [.github/workflows/release.yml, scripts/package.sh, packaging/README.txt]
   workflow_dispatch:
 
 permissions:
