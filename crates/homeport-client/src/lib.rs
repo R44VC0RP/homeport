@@ -363,6 +363,10 @@ impl Client {
                     // The file shrank under us; the server rejects the short upload.
                     break;
                 }
+                if lock(&inner.link).fail_fast() {
+                    let _ = send.reset(quinn::VarInt::from_u32(0));
+                    return Err(Error::Unreachable("link went offline".into()));
+                }
                 match tokio::time::timeout(UPLOAD_STALL, send.write_all(&buf[..n])).await {
                     Ok(r) => r?,
                     Err(_) => {
@@ -377,8 +381,23 @@ impl Client {
             lock(&inner.link).on_transfer(Instant::now(), sent, started.elapsed());
         }
         send.finish().ok();
+        let link = inner.clone();
         let mut resp = Responses { recv, deadline: Some(WRITE_DEADLINE), inner };
-        resp.next().await
+        // The server may take a while (fsync, a busy folder), but once the
+        // link counts as offline the answer is not coming: fail now so the
+        // system queues the change and retries after reconnecting.
+        let offline = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if lock(&link.link).fail_fast() {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            r = resp.next() => r,
+            _ = offline => Err(Error::Unreachable("link went offline".into())),
+        }
     }
 
     /// Creates a file (with `upload`), folder or symlink in `parent_id`.

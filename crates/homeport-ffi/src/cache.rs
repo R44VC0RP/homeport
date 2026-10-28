@@ -237,6 +237,13 @@ impl Cache {
         }
     }
 
+    /// A folder this client just created: its (empty) listing is known, so
+    /// changes inside it are kept. Revision -1: an enumeration asks the server.
+    pub fn note_new_dir(&self, id: &str) -> rusqlite::Result<()> {
+        self.db.execute("INSERT OR IGNORE INTO dirs (id, dir_rev, total) VALUES (?1, -1, 0)", [id])?;
+        Ok(())
+    }
+
     /// Forgets an item (and a folder's cached listing).
     pub fn remove_item(&self, id: &str) -> rusqlite::Result<()> {
         self.db.execute("DELETE FROM items WHERE id = ?1", [id])?;

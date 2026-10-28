@@ -952,6 +952,11 @@ impl Core {
             };
             s.note_result(&r);
             let item = r?;
+            if item.kind == Kind::Dir
+                && let Some(c) = s.cache()
+            {
+                c.note_new_dir(&item.id)?;
+            }
             let c = s.store_written(item, None, target_copy)?;
             Ok(c.into())
         })
@@ -991,7 +996,9 @@ impl Core {
             s.note_result(&r);
             let (item, conflict) = r?;
             let item = s.store_written(item, None, None)?;
-            let conflict = conflict.map(|c| s.store_written(c, None, None)).transpose()?;
+            // The conflict copy is new to the system: it arrives through the
+            // change feed (caching it here would make that report look old).
+            let conflict = conflict.map(|c| CachedItem { item: c, link_target: None });
             Ok(WriteOutcome { item: item.into(), conflict: conflict.map(Into::into) })
         })
         .await
