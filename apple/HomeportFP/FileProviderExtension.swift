@@ -195,11 +195,40 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             return
         }
         log.notice("prefetching \(ids.count) small files \(kind, privacy: .public) \(opened ?? dirId, privacy: .public)")
+        let asked = Date()
+        requestDownloads(ids)
+        // The cache only knows downloads it recorded; files downloaded
+        // before that (or evicted) can look undownloaded and produce no
+        // fetch. If no fetch has started shortly after, try files from
+        // anywhere once more.
+        guard kind != "anywhere for" else { return }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let fetched = self.lastFetchStart.map { $0 >= asked } ?? false
+            self.lock.unlock()
+            guard !fetched else { return }
+            let more = self.smallFiles(in: nil, excluding: opened, budget: 256 << 10, limit: 2)
+            log.notice("no fetch after prefetching \(kind, privacy: .public) \(opened ?? dirId, privacy: .public); \(more.count) more from anywhere")
+            self.requestDownloads(more)
+        }
+    }
+
+    private func requestDownloads(_ ids: [String]) {
         for id in ids {
-            manager.requestDownloadForItem(withIdentifier: NSFileProviderItemIdentifier(id)) { error in
+            manager?.requestDownloadForItem(withIdentifier: NSFileProviderItemIdentifier(id)) { error in
                 if let error { log.debug("nearby prefetch \(id, privacy: .public): \(String(describing: error), privacy: .public)") }
             }
         }
+    }
+
+    /// When the last fetch (of any kind) started.
+    private var lastFetchStart: Date?
+
+    private func noteFetchStart() {
+        lock.lock()
+        lastFetchStart = Date()
+        lock.unlock()
     }
 
     /// A user's first listing waiting for its folder to materialize.
@@ -283,6 +312,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             completionHandler(nil, nil, NSFileProviderError(.noSuchItem))
             return progress
         }
+        noteFetchStart()
         let token = CancelToken()
         progress.cancellationHandler = { token.cancel() }
         Task {
@@ -341,6 +371,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             completionHandler(nil, nil, NSRange(), [], NSFileProviderError(.noSuchItem))
             return progress
         }
+        noteFetchStart()
         let token = CancelToken()
         progress.cancellationHandler = { token.cancel() }
         Task {

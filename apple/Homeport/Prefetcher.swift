@@ -61,6 +61,11 @@ actor Prefetcher {
         "node_modules", ".git", "target", "build", "dist", ".next", "DerivedData", ".venv",
         "__pycache__", "Pods", ".build", ".turbo", ".cache", "vendor",
     ]
+    /// Generated trees, including build-release, build-debug and the like.
+    private static func skipped(_ name: String) -> Bool {
+        skip.contains(name) || name.hasPrefix("build-") || name.hasSuffix(".xcarchive")
+    }
+
     /// Folder names people open first in a repo.
     private static let folderPrior: [String: Int] = [
         "src": 9, "Sources": 9, "app": 8, "apps": 8, "packages": 8, "crates": 8, "lib": 7,
@@ -170,7 +175,7 @@ actor Prefetcher {
 
     private func lookAhead(in dir: URL, depth: Int) -> [Job] {
         guard policy.lookAhead else { return [] }
-        let dirs = entries(of: dir).filter { $0.isDir && $0.dataless && !Self.skip.contains($0.name) }
+        let dirs = entries(of: dir).filter { $0.isDir && $0.dataless && !Self.skipped($0.name) }
         return dirs.sorted { a, b in
             let pa = Self.folderPrior[a.name] ?? 0, pb = Self.folderPrior[b.name] ?? 0
             return pa != pb ? pa > pb : a.name.localizedStandardCompare(b.name) == .orderedAscending
@@ -207,7 +212,7 @@ actor Prefetcher {
                     low.append(j)
                 }
             }
-            for e in entries(of: dir) where e.isDir && !Self.skip.contains(e.name) {
+            for e in entries(of: dir) where e.isDir && !Self.skipped(e.name) {
                 if !e.dataless {
                     if depth + 1 < crawlDepth { scan.append((e.url, depth + 1)) }
                 } else if !queued.contains(e.url.path) {
@@ -295,7 +300,7 @@ actor Prefetcher {
 
     private func isDatalessDir(_ u: URL) -> Bool {
         let f = lstatFlags(u)
-        return f.isDir && f.dataless && !Self.skip.contains(u.lastPathComponent)
+        return f.isDir && f.dataless && !Self.skipped(u.lastPathComponent)
     }
 }
 
