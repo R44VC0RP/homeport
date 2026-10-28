@@ -97,7 +97,8 @@ fn write_error(s: &Shared, e: ClientError) -> CoreError {
                 | ErrorCode::Unsupported
                 | ErrorCode::BadRequest
                 | ErrorCode::NotADirectory
-                | ErrorCode::NotAFile,
+                | ErrorCode::NotAFile
+                | ErrorCode::CloudOnly,
             message,
         } => CoreError::Rejected { msg: message },
         e => e.into(),
