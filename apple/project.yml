@@ -16,7 +16,7 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "15.0"
     ARCHS: arm64
     DEAD_CODE_STRIPPING: YES
-    OTHER_CODE_SIGN_FLAGS: "--timestamp=none"
+    OTHER_CODE_SIGN_FLAGS: "--timestamp"
     # Like the shipped build: no get-task-allow.
     CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 targets:
