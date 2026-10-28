@@ -86,6 +86,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Print a pairing link and code for adding this server to a Mac.
+    Pair(PairArgs),
+    /// Show this server's name, address, fingerprint, shares and allowed logins.
+    Info(PairArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct PairArgs {
+    /// Address clients use (`ip:port`). Default: this node's tailnet IPv4
+    /// and the configured port.
+    #[arg(long)]
+    addr: Option<SocketAddr>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -163,6 +175,8 @@ async fn main() {
         None => run(args.config, args.run).await.inspect_err(|e| tracing::error!(error = %e, "homeportd failed")),
         Some(Cmd::Share { cmd }) => share_cmd(args.config, cmd),
         Some(Cmd::Service { cmd }) => service_cmd(args.config, cmd),
+        Some(Cmd::Pair(a)) => pair_cmd(args.config, a, false).await,
+        Some(Cmd::Info(a)) => pair_cmd(args.config, a, true).await,
     };
     if let Err(e) = result {
         eprintln!("homeportd: {e}");
@@ -257,6 +271,79 @@ fn service_cmd(config: Option<PathBuf>, cmd: ServiceCmd) -> Result<(), MainError
     };
     println!("{}", report.map_err(io_err("service"))?);
     Ok(())
+}
+
+/// `pair` and `info`: what a client needs to add this server.
+async fn pair_cmd(config: Option<PathBuf>, args: PairArgs, info: bool) -> Result<(), MainError> {
+    let home = home()?;
+    let cfg_path = config_path(config, &home);
+    let cfg = Config::load(&cfg_path)?;
+    let data_dir = cfg.data_dir.as_ref().map_or_else(|| Sys::data_dir(&home), |d| config::expand(d, &home));
+    // The identity the server uses (created now if it has never run).
+    let identity = tls::load_or_create(&data_dir)?;
+    let ts = auth::Tailscale::find(cfg.tailscale.clone());
+    let port = cfg.port.unwrap_or(proto::DEFAULT_PORT);
+    let addr = match (args.addr, cfg.bind) {
+        (Some(a), _) => a.to_string(),
+        (None, Some(ip)) => SocketAddr::new(ip, port).to_string(),
+        (None, None) => match ts.ipv4().await {
+            Ok(ip) => SocketAddr::new(ip, port).to_string(),
+            Err(e) => {
+                return Err(MainError::Usage(format!(
+                    "cannot find this node's tailnet IP ({e}); is Tailscale running? Or pass --addr <ip:port>"
+                )));
+            }
+        },
+    };
+    let name = cfg.name.clone().unwrap_or_else(Sys::host_name);
+    let fp = &identity.fingerprint;
+    let raw = fingerprint_bytes(fp);
+    let code = proto::pairing_code(&raw);
+    if !info {
+        println!("Add this server in Homeport (menu bar > Add Server…):\n");
+        println!("  Name         {name}");
+        println!("  Address      {addr}");
+        println!("  Code         {code}\n");
+        println!("Pick \"{name}\" in the list and check that Homeport shows the same code, or paste this link:\n");
+        println!("  {}\n", proto::pairing_link(&addr, fp, &name));
+        println!("Short form (for a QR code):\n");
+        println!("  {}", proto::pairing_short(&addr, fp));
+        return Ok(());
+    }
+    let (shares, defaults) = config_shares(&cfg, &home);
+    println!("name         {name}");
+    println!("os           {}", platform::Fs::OS_NAME);
+    println!("version      {}", env!("CARGO_PKG_VERSION"));
+    println!("address      {addr}");
+    println!("fingerprint  {fp}");
+    println!("code         {code}");
+    println!("config       {}", cfg_path.display());
+    println!("data         {}", data_dir.display());
+    println!("tailscale    {}", ts.bin.display());
+    let logins = if cfg.allow_logins.is_empty() {
+        match ts.self_node().await.map(|n| auth::effective_allowlist(Vec::new(), Some(&n))) {
+            Ok(Ok(l)) => format!("{} (owner of this node)", l.join(", ")),
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => format!("owner of this node (unknown: {e})"),
+        }
+    } else {
+        cfg.allow_logins.join(", ")
+    };
+    println!("allow        {logins}");
+    println!("shares       {}", if defaults { "(platform defaults)" } else { "" });
+    for (n, p) in shares {
+        println!("  {n:<16} {}", p.display());
+    }
+    Ok(())
+}
+
+/// The fingerprint's 32 bytes (it is always 64 hex digits from `tls`).
+fn fingerprint_bytes(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+    }
+    out
 }
 
 async fn run(config: Option<PathBuf>, args: RunArgs) -> Result<(), MainError> {

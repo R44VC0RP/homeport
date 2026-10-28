@@ -486,3 +486,41 @@ pub fn is_junk(name: &str) -> bool {
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0') && name.len() <= 255
 }
+
+/// Scheme of pairing links (`homeport://pair?addr=…&fp=…&name=…`).
+pub const PAIR_SCHEME: &str = "homeport";
+/// Prefix of the short pairing form, `HOMEPORT:<FINGERPRINT>:<ADDR>`: upper
+/// case hex and an address, so it fits a QR code's alphanumeric mode.
+pub const PAIR_SHORT_PREFIX: &str = "HOMEPORT:";
+
+/// The 6-digit code both sides show while pairing (`"123 456"`), derived
+/// from the certificate's SHA-256 so a person can compare it at a glance.
+/// It confirms the fingerprint a client is about to pin; it is not a secret.
+pub fn pairing_code(fingerprint: &[u8; 32]) -> String {
+    let folded = fingerprint.as_chunks::<4>().0.iter().fold(0u32, |acc, w| acc.rotate_left(5) ^ u32::from_be_bytes(*w));
+    let n = folded % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
+/// A pairing link: `homeport://pair?addr=<ip:port>&fp=<hex>&name=<name>`.
+pub fn pairing_link(addr: &str, fingerprint_hex: &str, name: &str) -> String {
+    format!("{PAIR_SCHEME}://pair?addr={}&fp={fingerprint_hex}&name={}", percent_encode(addr), percent_encode(name))
+}
+
+/// The short pairing form (see [`PAIR_SHORT_PREFIX`]).
+pub fn pairing_short(addr: &str, fingerprint_hex: &str) -> String {
+    format!("{PAIR_SHORT_PREFIX}{}:{}", fingerprint_hex.to_ascii_uppercase(), addr.to_ascii_uppercase())
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b':') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
