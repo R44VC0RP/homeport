@@ -1,0 +1,33 @@
+[package]
+name = "homeport-ffi"
+description = "UniFFI bindings over homeport-client for the Swift app and File Provider extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "homeport_ffi"
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+homeport-proto.workspace = true
+homeport-client.workspace = true
+futures.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uniffi = "0.32"
+
+[lints]
+workspace = true
