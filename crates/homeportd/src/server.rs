@@ -10,10 +10,12 @@ use quinn::{RecvStream, SendStream};
 use tokio::task::JoinSet;
 
 use crate::auth::Authorizer;
-use crate::index::{Index, IndexError, ListOutcome};
+use crate::index::{CreateReq, Index, IndexError, ListOutcome, Staged};
 use crate::tls::Identity;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// An upload may stall this long between chunks before it is abandoned.
+const UPLOAD_IDLE: Duration = Duration::from_secs(60);
 const CHANGE_BATCH: usize = 1000;
 
 #[derive(Debug, thiserror::Error)]
@@ -29,7 +31,9 @@ pub enum ServerError {
 #[derive(Debug, thiserror::Error)]
 enum StreamError {
     #[error("read request: {0}")]
-    Read(#[from] quinn::ReadToEndError),
+    Read(#[from] quinn::ReadExactError),
+    #[error("read upload: {0}")]
+    ReadBody(#[from] quinn::ReadError),
     #[error("write: {0}")]
     Write(#[from] quinn::WriteError),
     #[error("stream closed: {0}")]
@@ -130,29 +134,43 @@ fn error_frame(code: ErrorCode, message: impl Into<String>) -> Result<Bytes, pro
 }
 
 async fn handle_stream(ctx: &Conn, mut send: SendStream, mut recv: RecvStream) -> Result<(), StreamError> {
-    let raw = tokio::time::timeout(REQUEST_TIMEOUT, recv.read_to_end(64 * 1024))
-        .await
-        .map_err(|_| StreamError::Timeout)??;
-    let req: Request = match raw.get(..4).map(|p| proto::check_len([p[0], p[1], p[2], p[3]])) {
-        Some(Ok(len)) if len + 4 == raw.len() => match proto::decode(&raw[4..]) {
-            Ok(r) => r,
-            Err(e) => {
-                send.write_chunk(error_frame(ErrorCode::BadRequest, e.to_string())?).await?;
-                return Ok(send.finish()?);
-            }
-        },
-        _ => {
-            send.write_chunk(error_frame(ErrorCode::BadRequest, "malformed frame")?).await?;
+    // One request frame; uploads follow it with their content.
+    let header = async {
+        let mut prefix = [0u8; 4];
+        recv.read_exact(&mut prefix).await?;
+        let len = u32::from_be_bytes(prefix) as usize;
+        if len > proto::MAX_REQUEST {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; len];
+        recv.read_exact(&mut buf).await?;
+        Ok::<_, StreamError>(Some(buf))
+    };
+    let raw = tokio::time::timeout(REQUEST_TIMEOUT, header).await.map_err(|_| StreamError::Timeout)??;
+    let req: Request = match raw.map(|b| proto::decode(&b)) {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => {
+            send.write_chunk(error_frame(ErrorCode::BadRequest, e.to_string())?).await?;
+            return Ok(send.finish()?);
+        }
+        None => {
+            send.write_chunk(error_frame(ErrorCode::BadRequest, "request too large")?).await?;
             return Ok(send.finish()?);
         }
     };
     send.set_priority(req.priority.stream_priority())?;
     let started = Instant::now();
     let kind = request_kind(&req.body);
-    let result = dispatch(ctx, &mut send, req.body).await;
+    let result = dispatch(ctx, &mut send, &mut recv, req.body).await;
     match result {
         Ok(()) => {}
+        Err(StreamError::Index(IndexError::Collision(existing))) => {
+            write(&mut send, &Response::Collision { existing: *existing }).await?;
+        }
         Err(StreamError::Index(e)) => {
+            if !matches!(e, IndexError::NotFound) {
+                tracing::info!(kind, error = %e, "request failed");
+            }
             send.write_chunk(error_frame(e.code(), e.to_string())?).await?;
         }
         Err(e) => return Err(e),
@@ -172,8 +190,41 @@ fn request_kind(b: &RequestBody) -> &'static str {
         RequestBody::Changes { .. } => "changes",
         RequestBody::Ping { .. } => "ping",
         RequestBody::ReadLink { .. } => "readlink",
-        _ => "unsupported",
+        RequestBody::Thumbnail { .. } => "thumbnail",
+        RequestBody::Create { .. } => "create",
+        RequestBody::WriteContent { .. } => "write",
+        RequestBody::Modify { .. } => "modify",
+        RequestBody::Trash { .. } => "trash",
+        RequestBody::Untrash { .. } => "untrash",
+        RequestBody::Forget { .. } => "forget",
     }
+}
+
+/// Receives an upload's `size` bytes into a staging file.
+async fn receive(recv: &mut RecvStream, dir: &std::path::Path, size: u64) -> Result<Staged, StreamError> {
+    use std::io::Write;
+    let staged = Staged::new(dir);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged.path())
+        .map_err(IndexError::from_io)?;
+    let mut got: u64 = 0;
+    loop {
+        let chunk = tokio::time::timeout(UPLOAD_IDLE, recv.read_chunk(1 << 20, true))
+            .await
+            .map_err(|_| StreamError::Timeout)??;
+        let Some(chunk) = chunk else { break };
+        got += chunk.bytes.len() as u64;
+        if got > size {
+            return Err(IndexError::Incomplete(format!("more than the announced {size} bytes")).into());
+        }
+        file.write_all(&chunk.bytes).map_err(IndexError::from_io)?;
+    }
+    if got != size {
+        return Err(IndexError::Incomplete(format!("{got} of {size} bytes")).into());
+    }
+    Ok(staged)
 }
 
 async fn write(send: &mut SendStream, r: &Response) -> Result<(), StreamError> {
@@ -187,7 +238,7 @@ async fn write_outcome(send: &mut SendStream, dir_id: &str, o: ListOutcome) -> R
             write(send, &Response::NotModified { dir_id: dir_id.to_owned(), dir_rev }).await
         }
         ListOutcome::Listing(l) => {
-            for f in &l.frames {
+            for f in l.frames()? {
                 send.write_chunk(f.clone()).await?;
             }
             Ok(())
@@ -195,10 +246,51 @@ async fn write_outcome(send: &mut SendStream, dir_id: &str, o: ListOutcome) -> R
     }
 }
 
-async fn dispatch(ctx: &Conn, send: &mut SendStream, body: RequestBody) -> Result<(), StreamError> {
+async fn dispatch(
+    ctx: &Conn,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    body: RequestBody,
+) -> Result<(), StreamError> {
     let index = &ctx.index;
     let client = ctx.client_id.get().map(String::as_str);
     match body {
+        RequestBody::Create { op_id, parent_id, name, kind, size, link_target, meta, may_exist } => {
+            if let Some(id) = index.op_replay(&op_id)
+                && let Ok(item) = index.stat(&id).await
+            {
+                let _ = recv.stop(quinn::VarInt::from_u32(0));
+                return write(send, &Response::Item(item)).await;
+            }
+            let staged = match kind {
+                proto::Kind::File => Some(receive(recv, index.staging_dir(), size).await?),
+                _ => None,
+            };
+            let req = CreateReq { op_id, parent_id, name, kind, link_target, meta, may_exist };
+            let item = index.create(req, staged, client).await?;
+            write(send, &Response::Item(item)).await
+        }
+        RequestBody::WriteContent { id, base_content_rev, size, meta, device } => {
+            let staged = receive(recv, index.staging_dir(), size).await?;
+            let (item, conflict) = index.write_content(&id, base_content_rev, staged, meta, &device).await?;
+            write(send, &Response::Written { item, conflict }).await
+        }
+        RequestBody::Modify { id, new_parent_id, new_name, meta } => {
+            let item = index.modify(&id, new_parent_id.as_deref(), new_name.as_deref(), meta).await?;
+            write(send, &Response::Item(item)).await
+        }
+        RequestBody::Trash { id, listed, recursive } => {
+            let item = index.trash(&id, listed, recursive).await?;
+            write(send, &Response::Item(item)).await
+        }
+        RequestBody::Untrash { id, parent_id, name } => {
+            let item = index.untrash(&id, &parent_id, &name).await?;
+            write(send, &Response::Item(item)).await
+        }
+        RequestBody::Forget { id } => {
+            index.forget(&id).await?;
+            write(send, &Response::End).await
+        }
         RequestBody::Hello { protocol, client_id } => {
             if protocol != proto::PROTOCOL_VERSION {
                 let msg = format!("server speaks protocol {}, client {protocol}", proto::PROTOCOL_VERSION);
@@ -268,13 +360,6 @@ async fn dispatch(ctx: &Conn, send: &mut SendStream, body: RequestBody) -> Resul
             let idx = index.clone();
             let target = tokio::task::spawn_blocking(move || idx.read_link(&id)).await??;
             write(send, &Response::LinkTarget { target }).await
-        }
-        RequestBody::Write { .. }
-        | RequestBody::Create { .. }
-        | RequestBody::Rename { .. }
-        | RequestBody::Delete { .. } => {
-            send.write_chunk(error_frame(ErrorCode::Unsupported, "not implemented yet")?).await?;
-            Ok(())
         }
     }
 }

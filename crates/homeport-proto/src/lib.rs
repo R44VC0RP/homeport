@@ -9,7 +9,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Bumped on any incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// TLS ALPN identifier.
 pub const ALPN: &[u8] = b"homeport/1";
 /// Default UDP port of `homeportd`.
@@ -27,6 +27,11 @@ pub const READ_CHUNK: usize = 256 * 1024;
 pub const ROOT_ID: &str = "root";
 /// Prefix of share root identifiers (`root:dev`, `root:Downloads`).
 pub const SHARE_ID_PREFIX: &str = "root:";
+/// Identifier of the virtual container listing items clients moved to
+/// basebook's Trash (the File Provider trash container).
+pub const TRASH_ID: &str = "trash";
+/// Largest request header (the frame before an upload's content).
+pub const MAX_REQUEST: usize = 1024 * 1024;
 
 /// Item identifier: the APFS file ID in decimal, or `root` / `root:<share>`.
 pub type ItemId = String;
@@ -81,6 +86,33 @@ pub struct Item {
     pub rev: u64,
     /// Server `seq` at which its content (size or mtime) last changed.
     pub content_rev: u64,
+    /// Creation time; 0 when unknown (rows indexed before protocol 2).
+    pub crtime_ns: i64,
+    /// BSD flags (`UF_HIDDEN`, ...).
+    pub flags: u32,
+    /// Raw `com.apple.metadata:_kMDItemUserTags` value (Finder tags), when known.
+    #[serde(with = "serde_bytes")]
+    pub tags: Option<Vec<u8>>,
+}
+
+/// Metadata a client asks the server to apply. `None` leaves a field alone.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Meta {
+    pub mtime_ns: Option<i64>,
+    pub crtime_ns: Option<i64>,
+    /// Permission bits (`0o7777`).
+    pub mode: Option<u32>,
+    pub hidden: Option<bool>,
+    /// `Some(None)` removes the tags.
+    pub tags: Option<Option<Vec<u8>>>,
+    /// Extended attributes to set (syncable ones only; never removed).
+    pub xattrs: Vec<(String, Vec<u8>)>,
+}
+
+impl Meta {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -129,36 +161,67 @@ pub enum RequestBody {
     Ping {
         nonce: u64,
     },
-    // Phase 2+: answered with `Error { code: Unsupported }` for now.
-    Write {
-        id: ItemId,
-        base_content_rev: u64,
-        offset: u64,
-        len: u64,
-    },
-    Create {
-        parent_id: ItemId,
-        name: String,
-        kind: Kind,
-    },
-    Rename {
-        id: ItemId,
-        new_parent_id: ItemId,
-        new_name: String,
-        base_rev: u64,
-    },
-    Delete {
-        id: ItemId,
-        base_rev: u64,
-    },
     Thumbnail {
         id: ItemId,
         max_pixels: u32,
     },
     /// Answer: `LinkTarget`, or `Error { code: OutsideShare }` when the
-    /// target leaves the item's share. Appended last to keep the encoding of
-    /// earlier variants.
+    /// target leaves the item's share.
     ReadLink {
+        id: ItemId,
+    },
+    /// Creates a file, folder or symlink. A file's `size` bytes of content
+    /// follow the request frame on the same stream. Answer: `Item`, or
+    /// `Collision` when the name is taken. Replaying an `op_id` answers the
+    /// item it created.
+    Create {
+        op_id: String,
+        parent_id: ItemId,
+        name: String,
+        kind: Kind,
+        size: u64,
+        link_target: Option<String>,
+        meta: Meta,
+        /// The item may already exist (re-import): an existing folder, or a
+        /// file with the same content, is answered instead of a collision.
+        may_exist: bool,
+    },
+    /// Replaces a file's content in place (its id stays). `size` bytes
+    /// follow. When `base_content_rev` is not the current content, the
+    /// upload is kept as a conflict copy beside it. Answer: `Written`.
+    WriteContent {
+        id: ItemId,
+        /// `None`: the client has no base version (skip the check).
+        base_content_rev: Option<u64>,
+        size: u64,
+        meta: Meta,
+        /// Shown in conflict copy names ("name (airbook conflict ...)").
+        device: String,
+    },
+    /// Renames, moves and/or changes metadata. Answer: `Item` or `Collision`.
+    Modify {
+        id: ItemId,
+        new_parent_id: Option<ItemId>,
+        new_name: Option<String>,
+        meta: Meta,
+    },
+    /// Moves an item to basebook's Trash. With `listed` it shows in the
+    /// trash container (`TRASH_ID`) for Put Back. Non-empty folders need
+    /// `recursive`. Answer: `Item` (its parent is `TRASH_ID` when listed).
+    Trash {
+        id: ItemId,
+        listed: bool,
+        recursive: bool,
+    },
+    /// Puts a trashed item back. Answer: `Item` or `Collision`.
+    Untrash {
+        id: ItemId,
+        parent_id: ItemId,
+        name: String,
+    },
+    /// Drops an item from the trash container; it stays in basebook's Trash.
+    /// Answer: `End`.
+    Forget {
         id: ItemId,
     },
 }
@@ -180,6 +243,16 @@ pub enum ErrorCode {
     VersionMismatch,
     Unsupported,
     Internal,
+    /// A folder is not empty.
+    NotEmpty,
+    /// The disk is full.
+    NoSpace,
+    /// The name is not allowed (`/`, `..`, too long, ...).
+    BadName,
+    /// The filesystem refused (permissions).
+    Denied,
+    /// The upload ended before all its bytes arrived.
+    Incomplete,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -249,6 +322,16 @@ pub enum Response {
     LinkTarget {
         target: String,
     },
+    /// The name is taken (case-insensitively) by `existing`.
+    Collision {
+        existing: Item,
+    },
+    /// Answer to `WriteContent`. On a conflict `item` is the server's own
+    /// (unchanged) version and `conflict` the copy holding the upload.
+    Written {
+        item: Item,
+        conflict: Option<Item>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -299,4 +382,33 @@ pub fn is_precompressed(name: &str) -> bool {
         "jar", "apk", "ipa", "xip", "br", "lz4",
     ];
     name.rsplit_once('.').is_some_and(|(_, ext)| EXT.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+}
+
+/// Names a client never uploads: Finder metadata and editor temporary files
+/// (TextEdit `.sb-` saves, vim swap and `4913` probes, JetBrains and Office
+/// temporaries, backups ending in `~`).
+pub fn is_junk(name: &str) -> bool {
+    if matches!(name, ".DS_Store" | "Icon\r" | "4913" | ".localized") || name.starts_with("._") {
+        return true;
+    }
+    if name.contains(".sb-") || name.ends_with('~') || name.starts_with("~$") {
+        return true;
+    }
+    if name.starts_with("~WRL") && name.ends_with(".tmp") {
+        return true;
+    }
+    if name.starts_with(".~lock.") && name.ends_with('#') {
+        return true;
+    }
+    if name.ends_with("___jb_tmp___") || name.ends_with("___jb_old___") {
+        return true;
+    }
+    // vim swap files: .name.swp ... .name.swa (and .swo, .swn, ...).
+    let b = name.as_bytes();
+    b.len() > 5 && b[0] == b'.' && name[..b.len() - 1].ends_with(".sw") && (b'a'..=b'p').contains(&b[b.len() - 1])
+}
+
+/// Whether `name` is acceptable as one path component on the server.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0') && name.len() <= 255
 }

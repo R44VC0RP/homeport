@@ -16,8 +16,15 @@ use bytes::Bytes;
 use homeport_proto::{self as proto, Deleted, Item, ItemId, Kind, Response};
 use lru::LruCache;
 
-use crate::db::{Db, DbError, Loaded, Op};
+use crate::db::{Db, DbError, Loaded, Op, Trashed};
 use crate::fsops::{self, Entry, Volume};
+
+mod writes;
+pub use writes::{CreateReq, Staged, WriteDirs};
+
+/// Directories with at most this many entries have every entry's Finder
+/// tags read on each scan; larger ones only for entries known to have tags.
+const TAG_SCAN_MAX: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -41,6 +48,20 @@ pub enum IndexError {
     Join(#[from] tokio::task::JoinError),
     #[error("index lock poisoned")]
     Poisoned,
+    #[error("name is taken")]
+    Collision(Box<Item>),
+    #[error("folder is not empty")]
+    NotEmpty,
+    #[error("disk is full")]
+    NoSpace,
+    #[error("name not allowed")]
+    BadName,
+    #[error("permission denied")]
+    Denied,
+    #[error("upload incomplete: {0}")]
+    Incomplete(String),
+    #[error("bad request: {0}")]
+    BadRequest(String),
 }
 
 impl IndexError {
@@ -51,7 +72,12 @@ impl IndexError {
             Self::OutsideShare => C::OutsideShare,
             Self::NotADirectory => C::NotADirectory,
             Self::NotAFile => C::NotAFile,
-            Self::BadId(_) => C::BadRequest,
+            Self::BadId(_) | Self::BadRequest(_) => C::BadRequest,
+            Self::NotEmpty => C::NotEmpty,
+            Self::NoSpace => C::NoSpace,
+            Self::BadName => C::BadName,
+            Self::Denied => C::Denied,
+            Self::Incomplete(_) => C::Incomplete,
             _ => C::Internal,
         }
     }
@@ -61,6 +87,10 @@ impl IndexError {
             Some(libc::ENOENT) | Some(libc::ESTALE) => Self::NotFound,
             Some(libc::ENOTDIR) => Self::NotADirectory,
             Some(libc::ELOOP) => Self::NotADirectory,
+            Some(libc::ENOTEMPTY) => Self::NotEmpty,
+            Some(libc::ENOSPC) | Some(libc::EDQUOT) => Self::NoSpace,
+            Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS) => Self::Denied,
+            Some(libc::ENAMETOOLONG) | Some(libc::EILSEQ) => Self::BadName,
             _ => Self::Io(e),
         }
     }
@@ -76,10 +106,21 @@ pub struct Share {
 
 /// A directory listing ready to send.
 pub struct Listing {
+    pub dir_id: ItemId,
     pub dir_rev: u64,
     pub items: Vec<Item>,
-    /// Pre-encoded `Items` frames.
-    pub frames: Vec<Bytes>,
+    /// `Items` frames, encoded on first use.
+    frames: std::sync::OnceLock<Vec<Bytes>>,
+}
+
+impl Listing {
+    pub fn frames(&self) -> Result<&[Bytes], IndexError> {
+        if let Some(f) = self.frames.get() {
+            return Ok(f);
+        }
+        let f = encode_frames(&self.dir_id, self.dir_rev, &self.items)?;
+        Ok(self.frames.get_or_init(|| f))
+    }
 }
 
 pub enum ListOutcome {
@@ -104,25 +145,36 @@ pub struct Index {
     state: Mutex<State>,
     dir_locks: Mutex<HashMap<ItemId, Weak<tokio::sync::Mutex<()>>>>,
     root: Arc<Listing>,
+    writes: WriteDirs,
+    /// Recent creates: client op id -> file id.
+    ops: Mutex<HashMap<String, ItemId>>,
+    /// Items in the trash container.
+    trashed: Mutex<HashMap<ItemId, Trashed>>,
 }
 
 /// What an ID refers to.
 enum Target {
     Root,
     Path { path: PathBuf, share: usize },
+    /// In basebook's Trash, put there by a client.
+    Trashed { path: PathBuf },
 }
 
-fn same_attrs(a: &Item, b: &Item) -> bool {
-    a.parent_id == b.parent_id
-        && a.name == b.name
-        && a.kind == b.kind
-        && a.size == b.size
-        && a.mtime_ns == b.mtime_ns
-        && a.ctime_ns == b.ctime_ns
-        && a.mode == b.mode
+/// Whether a fresh scan of an item shows nothing new. Rows indexed before
+/// creation times, flags and tags were recorded (crtime 0) are compared on
+/// the old fields only, so upgrading does not report every item as changed.
+fn same_attrs(old: &Item, new: &Item) -> bool {
+    let base = old.parent_id == new.parent_id
+        && old.name == new.name
+        && old.kind == new.kind
+        && old.size == new.size
+        && old.mtime_ns == new.mtime_ns
+        && old.ctime_ns == new.ctime_ns
+        && old.mode == new.mode;
+    base && (old.crtime_ns == 0 || (old.crtime_ns == new.crtime_ns && old.flags == new.flags && old.tags == new.tags))
 }
 
-fn encode_listing(dir_id: &str, dir_rev: u64, items: Vec<Item>) -> Result<Listing, IndexError> {
+fn encode_frames(dir_id: &str, dir_rev: u64, items: &[Item]) -> Result<Vec<Bytes>, IndexError> {
     let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
     let pages: Vec<&[Item]> = if items.is_empty() { vec![&[]] } else { items.chunks(proto::PAGE_SIZE).collect() };
     let n = pages.len();
@@ -137,7 +189,30 @@ fn encode_listing(dir_id: &str, dir_rev: u64, items: Vec<Item>) -> Result<Listin
             items: page.to_vec(),
         })?);
     }
-    Ok(Listing { dir_rev, items, frames })
+    Ok(frames)
+}
+
+fn encode_listing(dir_id: &str, dir_rev: u64, items: Vec<Item>) -> Result<Listing, IndexError> {
+    Ok(Listing { dir_id: dir_id.to_owned(), dir_rev, items, frames: std::sync::OnceLock::new() })
+}
+
+/// An item for a scanned entry (revisions unset).
+pub(crate) fn item_of(id: ItemId, parent_id: &str, e: Entry, tags: Option<Vec<u8>>) -> Item {
+    Item {
+        id,
+        parent_id: parent_id.to_owned(),
+        name: e.name,
+        kind: e.kind,
+        size: e.size,
+        mtime_ns: e.mtime_ns,
+        ctime_ns: e.ctime_ns,
+        mode: e.mode,
+        rev: 0,
+        content_rev: 0,
+        crtime_ns: e.crtime_ns,
+        flags: e.flags,
+        tags,
+    }
 }
 
 impl Index {
@@ -146,6 +221,7 @@ impl Index {
         db: Arc<Db>,
         loaded: Loaded,
         lru_capacity: usize,
+        writes: WriteDirs,
     ) -> Result<Self, IndexError> {
         let mut out = Vec::new();
         let mut volume: Option<Volume> = None;
@@ -178,6 +254,9 @@ impl Index {
                 mode: st.mode,
                 rev: 1,
                 content_rev: 1,
+                crtime_ns: st.crtime_ns,
+                flags: 0,
+                tags: None,
             });
             out.push(Share { name, id, path, ino: st.ino });
         }
@@ -194,6 +273,9 @@ impl Index {
             state: Mutex::new(state),
             dir_locks: Mutex::new(HashMap::new()),
             root,
+            writes,
+            ops: Mutex::new(loaded.ops),
+            trashed: Mutex::new(loaded.trashed),
         })
     }
 
@@ -231,6 +313,14 @@ impl Index {
 
     /// Maps an ID to its current path, rejecting anything outside the shares.
     fn resolve(&self, id: &str) -> Result<Target, IndexError> {
+        match self.resolve_any(id)? {
+            Target::Trashed { .. } => Err(IndexError::OutsideShare),
+            t => Ok(t),
+        }
+    }
+
+    /// Like `resolve`, also accepting items in the trash container.
+    fn resolve_any(&self, id: &str) -> Result<Target, IndexError> {
         if id == proto::ROOT_ID {
             return Ok(Target::Root);
         }
@@ -244,8 +334,13 @@ impl Index {
             return Ok(Target::Path { path: s.path.clone(), share });
         }
         let path = self.volume.path_of(ino).map_err(IndexError::from_io)?;
-        let share = self.share_of(&path).ok_or(IndexError::OutsideShare)?;
-        Ok(Target::Path { path, share })
+        match self.share_of(&path) {
+            Some(share) => Ok(Target::Path { path, share }),
+            None if path.starts_with(&self.writes.trash) && self.trashed.lock().map_err(|_| IndexError::Poisoned)?.contains_key(id) => {
+                Ok(Target::Trashed { path })
+            }
+            None => Err(IndexError::OutsideShare),
+        }
     }
 
     fn parent_id_of(&self, path: &Path, share: usize) -> Result<ItemId, IndexError> {
@@ -298,6 +393,9 @@ impl Index {
         let id = self.canonical(id);
         let listing = if id == proto::ROOT_ID {
             self.root.clone()
+        } else if id == proto::TRASH_ID {
+            let this = self.clone();
+            Arc::new(tokio::task::spawn_blocking(move || this.trash_listing()).await??)
         } else {
             let cached = self.state()?.lru.get(&id).cloned();
             match cached {
@@ -326,6 +424,15 @@ impl Index {
     ) -> Result<(Arc<Listing>, Vec<ItemId>), IndexError> {
         let lock = self.dir_lock(id)?;
         let _guard = lock.lock().await;
+        self.refresh_locked(id, use_cache).await
+    }
+
+    /// `refresh_inner` for a caller that holds the directory's lock.
+    async fn refresh_locked(
+        self: &Arc<Self>,
+        id: &str,
+        use_cache: bool,
+    ) -> Result<(Arc<Listing>, Vec<ItemId>), IndexError> {
         let (old, prev_rev) = {
             let mut st = self.state()?;
             if use_cache && let Some(l) = st.lru.get(id) {
@@ -334,17 +441,27 @@ impl Index {
             let prev_rev = st.indexed.get(id).map(|(r, _)| *r);
             (st.lru.peek(id).cloned(), prev_rev)
         };
+        if old.is_none() && prev_rev.is_some() {
+            // The rows are read back from the database: make sure our own
+            // recent writes are in it.
+            self.db.flush().await?;
+        }
         let this = self.clone();
         let id_owned = id.to_owned();
         let scanned = tokio::task::spawn_blocking(move || -> Result<_, IndexError> {
             let target = this.resolve(&id_owned)?;
-            let Target::Path { path, .. } = target else { return Err(IndexError::BadId(id_owned)) };
+            let path = match target {
+                Target::Path { path, .. } => path,
+                Target::Trashed { .. } => return Err(IndexError::OutsideShare),
+                Target::Root => return Err(IndexError::BadId(id_owned)),
+            };
             let entries = fsops::scan_dir(&path).map_err(IndexError::from_io)?;
             let old_items = match old {
                 Some(l) => l.items.clone(),
                 None if prev_rev.is_some() => this.db.dir_items(&id_owned)?,
                 None => Vec::new(),
             };
+            let entries = this.with_tags(&path, entries, &old_items);
             Ok((path, entries, old_items))
         })
         .await?;
@@ -379,13 +496,30 @@ impl Index {
         Ok(())
     }
 
+    /// Pairs scanned entries with their Finder tags (`.DS_Store` dropped):
+    /// read for every entry of a small folder, else only where the previous
+    /// scan found some.
+    fn with_tags(&self, dir: &Path, entries: Vec<Entry>, old: &[Item]) -> Vec<(Entry, Option<Vec<u8>>)> {
+        let all = entries.len() <= TAG_SCAN_MAX;
+        let tagged: HashSet<&str> = old.iter().filter(|i| i.tags.is_some()).map(|i| i.id.as_str()).collect();
+        entries
+            .into_iter()
+            .filter(|e| e.name != ".DS_Store")
+            .map(|e| {
+                let read = all || tagged.contains(self.id_for(e.ino).as_str());
+                let tags = if read { fsops::get_xattr(&dir.join(&e.name), fsops::TAGS_XATTR).ok().flatten() } else { None };
+                (e, tags)
+            })
+            .collect()
+    }
+
     /// Diffs a scan against the previous items, stamping changes with a new seq.
     fn reconcile(
         &self,
         dir_id: &str,
         path: &Path,
         old: Vec<Item>,
-        entries: Vec<Entry>,
+        entries: Vec<(Entry, Option<Vec<u8>>)>,
         prev_rev: Option<u64>,
     ) -> Result<(u64, Vec<Item>, Vec<ItemId>), IndexError> {
         let mut old: HashMap<ItemId, Item> = old.into_iter().map(|i| (i.id.clone(), i)).collect();
@@ -400,19 +534,9 @@ impl Index {
         }
         let mut items = Vec::with_capacity(entries.len());
         let mut upserts = Vec::new();
-        for e in entries {
-            let mut item = Item {
-                id: self.id_for(e.ino),
-                parent_id: dir_id.to_owned(),
-                name: e.name,
-                kind: e.kind,
-                size: e.size,
-                mtime_ns: e.mtime_ns,
-                ctime_ns: e.ctime_ns,
-                mode: e.mode,
-                rev: 0,
-                content_rev: 0,
-            };
+        for (e, tags) in entries {
+            let id = self.id_for(e.ino);
+            let mut item = item_of(id, dir_id, e, tags);
             match old.remove(&item.id) {
                 Some(o) if same_attrs(&o, &item) => items.push(o),
                 Some(o) => {
@@ -463,10 +587,10 @@ impl Index {
     /// Current attributes of one item.
     pub async fn stat(self: &Arc<Self>, id: &str) -> Result<Item, IndexError> {
         let id = self.canonical(id);
-        if id == proto::ROOT_ID {
+        if id == proto::ROOT_ID || id == proto::TRASH_ID {
             return Ok(Item {
                 id: id.clone(),
-                parent_id: id,
+                parent_id: proto::ROOT_ID.to_owned(),
                 name: String::new(),
                 kind: Kind::Dir,
                 size: 0,
@@ -475,6 +599,9 @@ impl Index {
                 mode: 0o755,
                 rev: 1,
                 content_rev: 1,
+                crtime_ns: 0,
+                flags: 0,
+                tags: None,
             });
         }
         if let Some(it) = self.root.items.iter().find(|i| i.id == id) {
@@ -483,24 +610,18 @@ impl Index {
         let this = self.clone();
         let idc = id.clone();
         let (fresh, row) = tokio::task::spawn_blocking(move || -> Result<_, IndexError> {
-            let Target::Path { path, share, .. } = this.resolve(&idc)? else { return Err(IndexError::NotFound) };
+            let (path, share) = match this.resolve_any(&idc)? {
+                Target::Path { path, share } => (path, share),
+                Target::Trashed { .. } => return Ok((None, this.trashed_item(&idc)?)),
+                Target::Root => return Err(IndexError::NotFound),
+            };
             let e = fsops::lstat(&path).map_err(IndexError::from_io)?;
             let parent_id = this.parent_id_of(&path, share)?;
-            let fresh = Item {
-                id: idc.clone(),
-                parent_id,
-                name: e.name,
-                kind: e.kind,
-                size: e.size,
-                mtime_ns: e.mtime_ns,
-                ctime_ns: e.ctime_ns,
-                mode: e.mode,
-                rev: 0,
-                content_rev: 0,
-            };
-            Ok((fresh, this.db.item(&idc)?))
+            let tags = fsops::get_xattr(&path, fsops::TAGS_XATTR).ok().flatten();
+            Ok((Some(item_of(idc.clone(), &parent_id, e, tags)), this.db.item(&idc)?))
         })
         .await??;
+        let Some(fresh) = fresh else { return row.ok_or(IndexError::NotFound) };
         if let Some(row) = row.filter(|r| same_attrs(r, &fresh)) {
             return Ok(row);
         }
@@ -527,7 +648,10 @@ impl Index {
 
     /// Opens a regular file for reading. Returns the file, its size, name and content rev.
     pub fn open_file(&self, id: &str) -> Result<(OwnedFd, u64, String, u64), IndexError> {
-        let Target::Path { path, .. } = self.resolve(id)? else { return Err(IndexError::NotAFile) };
+        let path = match self.resolve_any(id)? {
+            Target::Path { path, .. } | Target::Trashed { path } => path,
+            Target::Root => return Err(IndexError::NotAFile),
+        };
         let fd = fsops::open_nofollow(&path, libc::O_RDONLY).map_err(|e| match e.raw_os_error() {
             Some(libc::ELOOP) => IndexError::NotAFile,
             _ => IndexError::from_io(e),
@@ -604,15 +728,13 @@ impl Index {
     ) -> Result<(Vec<Item>, Vec<Deleted>), IndexError> {
         let st = self.state()?;
         let Some(have) = st.have.get(client) else { return Ok((Vec::new(), Vec::new())) };
-        let changed: Vec<Item> = changed.into_iter().filter(|i| have.contains(&i.parent_id)).collect();
+        // Every client sees the trash container.
+        let has = |p: &str| p == proto::TRASH_ID || have.contains(p);
+        let changed: Vec<Item> = changed.into_iter().filter(|i| has(&i.parent_id)).collect();
         let alive: HashSet<&str> = changed.iter().map(|i| i.id.as_str()).collect();
         let deleted = deleted
             .into_iter()
-            .filter(|(d, now)| {
-                have.contains(&d.parent_id)
-                    && !alive.contains(d.id.as_str())
-                    && !now.as_ref().is_some_and(|p| have.contains(p))
-            })
+            .filter(|(d, now)| has(&d.parent_id) && !alive.contains(d.id.as_str()) && !now.as_deref().is_some_and(has))
             .map(|(d, _)| d)
             .collect();
         Ok((changed, deleted))

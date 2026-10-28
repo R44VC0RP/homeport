@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use homeport_client::{ChangeEvent, Client, Config, Error, ListResult, parse_fingerprint};
-use homeport_proto::{Item, Kind, Priority};
+use homeport_proto::{Item, Kind, Meta, Priority};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -69,6 +69,41 @@ enum Cmd {
     },
     /// Measure time-to-listing and read throughput.
     Bench(bench::BenchArgs),
+    /// Upload a local file as DIR/NAME (or replace TARGET's content with --replace).
+    Put {
+        local: PathBuf,
+        /// Destination folder (path or id), or with --replace the file to overwrite.
+        dest: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// Overwrite the content of an existing file (base: its current content rev).
+        #[arg(long)]
+        replace: bool,
+        /// With --replace: the base content rev (default: current, i.e. no conflict).
+        #[arg(long)]
+        base: Option<u64>,
+    },
+    /// Create a folder.
+    Mkdir { dir: String, name: String },
+    /// Rename and/or move an item.
+    Mv {
+        target: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Move an item to the server's Trash (listed in the trash container).
+    Trash {
+        target: String,
+        #[arg(long)]
+        recursive: bool,
+        /// Not shown in the trash container (a delete).
+        #[arg(long)]
+        unlisted: bool,
+    },
+    /// Put a trashed item (by id) back.
+    Untrash { id: String, dir: String, name: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,7 +152,7 @@ fn client_id() -> String {
 }
 
 fn is_id(s: &str) -> bool {
-    s == "root" || s.starts_with("root:") || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    s == "root" || s == "trash" || s.starts_with("root:") || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
 async fn target_item(c: &Client, target: &str) -> Result<Item, Error> {
@@ -301,6 +336,60 @@ async fn run(args: Args) -> Result<(), CliError> {
             }
         }
         Cmd::Bench(b) => bench::run(&c, b, &mut out).await?,
+        Cmd::Put { local, dest, name, replace, base } => {
+            let file = std::fs::File::open(&local)?;
+            let size = file.metadata()?.len();
+            let progress = |_: u64| {};
+            let up = homeport_client::Upload { file, size, progress: &progress };
+            let started = std::time::Instant::now();
+            let target = target_item(&c, &dest).await?;
+            let device = "cli";
+            if replace {
+                let base = base.or(Some(target.content_rev));
+                let (item, conflict) =
+                    c.write_content(&target.id, base, Meta::default(), device, up, Priority::UserOpen).await?;
+                print_item(&mut out, &item)?;
+                if let Some(cp) = conflict {
+                    write!(out, "conflict copy ")?;
+                    print_item(&mut out, &cp)?;
+                }
+            } else {
+                let name = name
+                    .or_else(|| local.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .ok_or_else(|| CliError::Usage("no name".into()))?;
+                let op = format!("cli-{:016x}", rand::random::<u64>());
+                let item = c
+                    .create(&op, &target.id, &name, Kind::File, None, Meta::default(), false, Some(up), Priority::UserOpen)
+                    .await?;
+                print_item(&mut out, &item)?;
+            }
+            writeln!(out, "{size} bytes in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0)?;
+        }
+        Cmd::Mkdir { dir, name } => {
+            let d = target_item(&c, &dir).await?;
+            let op = format!("cli-{:016x}", rand::random::<u64>());
+            let item = c.create(&op, &d.id, &name, Kind::Dir, None, Meta::default(), false, None, Priority::Visible).await?;
+            print_item(&mut out, &item)?;
+        }
+        Cmd::Mv { target, to, name } => {
+            let t = target_item(&c, &target).await?;
+            let to = match to {
+                Some(d) => Some(target_item(&c, &d).await?.id),
+                None => None,
+            };
+            let item = c.modify(&t.id, to, name, Meta::default()).await?;
+            print_item(&mut out, &item)?;
+        }
+        Cmd::Trash { target, recursive, unlisted } => {
+            let t = target_item(&c, &target).await?;
+            let item = c.trash(&t.id, !unlisted, recursive).await?;
+            print_item(&mut out, &item)?;
+        }
+        Cmd::Untrash { id, dir, name } => {
+            let d = target_item(&c, &dir).await?;
+            let item = c.untrash(&id, &d.id, &name).await?;
+            print_item(&mut out, &item)?;
+        }
     }
     Ok(())
 }

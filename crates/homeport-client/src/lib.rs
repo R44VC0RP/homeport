@@ -20,7 +20,7 @@ use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, WeakShared};
 use homeport_proto::{
-    self as proto, Deleted, ErrorCode, Item, ItemId, ListDirReq, Priority, Request, RequestBody, Response,
+    self as proto, Deleted, ErrorCode, Item, ItemId, Kind, ListDirReq, Meta, Priority, Request, RequestBody, Response,
 };
 use quinn::{Connection, Endpoint, RecvStream};
 use tokio::sync::Notify;
@@ -40,6 +40,10 @@ pub enum Error {
     AnchorExpired { index_id: u64, seq: u64 },
     #[error("configuration: {0}")]
     Config(String),
+    #[error("name is taken by item {}", .0.id)]
+    Collision(Box<Item>),
+    #[error("local file: {0}")]
+    Local(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -223,6 +227,7 @@ impl Responses {
         }?;
         match frame {
             Some(Response::Error { code, message }) => Err(Error::Server { code, message }),
+            Some(Response::Collision { existing }) => Err(Error::Collision(Box::new(existing))),
             Some(r) => Ok(r),
             None => Err(Error::Protocol("response ended early".into())),
         }
@@ -306,7 +311,174 @@ fn unexpected(r: &Response) -> Error {
     Error::Protocol(format!("unexpected response {}", name.split([' ', '(', '{']).next().unwrap_or("?")))
 }
 
+/// Uploads are sent in pieces of this size.
+const UPLOAD_CHUNK: usize = 256 * 1024;
+/// A piece may wait this long for flow control before the link counts as down.
+const UPLOAD_STALL: Duration = Duration::from_secs(20);
+/// Time allowed for the server's answer once a write request is complete.
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Content for an upload.
+pub struct Upload<'a> {
+    pub file: std::fs::File,
+    pub size: u64,
+    /// Called with the bytes sent so far.
+    pub progress: &'a (dyn Fn(u64) + Send + Sync),
+}
+
 impl Client {
+    /// Sends a write request, followed by `upload`'s content, and returns
+    /// its one answer.
+    async fn write_request(&self, priority: Priority, body: RequestBody, upload: Option<Upload<'_>>) -> Result<Response> {
+        let inner = self.inner.clone();
+        *lock(&inner.last_activity) = Instant::now();
+        if lock(&inner.link).fail_fast() {
+            return Err(Error::Unreachable("link is offline".into()));
+        }
+        let frame = proto::encode_frame(&Request { priority, body })?;
+        let budget = inner.cfg.request_deadline.max(Duration::from_secs(2));
+        let open = async {
+            let conn = inner.connection(budget).await?;
+            let (mut send, recv) = conn.open_bi().await?;
+            send.set_priority(priority.stream_priority()).ok();
+            send.write_chunk(frame).await?;
+            Ok::<_, Error>((send, recv))
+        };
+        let (mut send, recv) = match tokio::time::timeout(budget, open).await {
+            Ok(r) => r?,
+            Err(_) => {
+                inner.probe_now.notify_one();
+                return Err(Error::Unreachable(format!("no connection within {} ms", budget.as_millis())));
+            }
+        };
+        if let Some(up) = upload {
+            let started = Instant::now();
+            let mut file = up.file;
+            let mut buf = vec![0u8; UPLOAD_CHUNK];
+            let mut sent: u64 = 0;
+            while sent < up.size {
+                let want = (up.size - sent).min(UPLOAD_CHUNK as u64) as usize;
+                let n = std::io::Read::read(&mut file, &mut buf[..want]).map_err(|e| Error::Local(e.to_string()))?;
+                if n == 0 {
+                    // The file shrank under us; the server rejects the short upload.
+                    break;
+                }
+                match tokio::time::timeout(UPLOAD_STALL, send.write_all(&buf[..n])).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        inner.probe_now.notify_one();
+                        let _ = send.reset(quinn::VarInt::from_u32(0));
+                        return Err(Error::Unreachable("upload stalled".into()));
+                    }
+                }
+                sent += n as u64;
+                (up.progress)(sent);
+            }
+            lock(&inner.link).on_transfer(Instant::now(), sent, started.elapsed());
+        }
+        send.finish().ok();
+        let mut resp = Responses { recv, deadline: Some(WRITE_DEADLINE), inner };
+        resp.next().await
+    }
+
+    /// Creates a file (with `upload`), folder or symlink in `parent_id`.
+    /// `op_id` makes retries safe: a repeated create answers the item the
+    /// first one made. `Error::Collision` when the name is taken.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create(
+        &self,
+        op_id: &str,
+        parent_id: &str,
+        name: &str,
+        kind: Kind,
+        link_target: Option<String>,
+        meta: Meta,
+        may_exist: bool,
+        upload: Option<Upload<'_>>,
+        priority: Priority,
+    ) -> Result<Item> {
+        let size = upload.as_ref().map_or(0, |u| u.size);
+        let body = RequestBody::Create {
+            op_id: op_id.to_owned(),
+            parent_id: parent_id.to_owned(),
+            name: name.to_owned(),
+            kind,
+            size,
+            link_target,
+            meta,
+            may_exist,
+        };
+        match self.write_request(priority, body, upload).await? {
+            Response::Item(i) => Ok(i),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Replaces a file's content. Returns the item and, when the file had
+    /// changed since `base_content_rev`, the conflict copy holding the upload.
+    pub async fn write_content(
+        &self,
+        id: &str,
+        base_content_rev: Option<u64>,
+        meta: Meta,
+        device: &str,
+        upload: Upload<'_>,
+        priority: Priority,
+    ) -> Result<(Item, Option<Item>)> {
+        let body = RequestBody::WriteContent {
+            id: id.to_owned(),
+            base_content_rev,
+            size: upload.size,
+            meta,
+            device: device.to_owned(),
+        };
+        match self.write_request(priority, body, Some(upload)).await? {
+            Response::Written { item, conflict } => Ok((item, conflict)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Renames, moves and/or changes metadata.
+    pub async fn modify(
+        &self,
+        id: &str,
+        new_parent_id: Option<String>,
+        new_name: Option<String>,
+        meta: Meta,
+    ) -> Result<Item> {
+        let body = RequestBody::Modify { id: id.to_owned(), new_parent_id, new_name, meta };
+        match self.write_request(Priority::Visible, body, None).await? {
+            Response::Item(i) => Ok(i),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Moves an item to the server's Trash (`listed`: into the trash container).
+    pub async fn trash(&self, id: &str, listed: bool, recursive: bool) -> Result<Item> {
+        let body = RequestBody::Trash { id: id.to_owned(), listed, recursive };
+        match self.write_request(Priority::Visible, body, None).await? {
+            Response::Item(i) => Ok(i),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Puts a trash container item back.
+    pub async fn untrash(&self, id: &str, parent_id: &str, name: &str) -> Result<Item> {
+        let body = RequestBody::Untrash { id: id.to_owned(), parent_id: parent_id.to_owned(), name: name.to_owned() };
+        match self.write_request(Priority::Visible, body, None).await? {
+            Response::Item(i) => Ok(i),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Drops an item from the trash container (it stays in the server's Trash).
+    pub async fn forget(&self, id: &str) -> Result<()> {
+        match self.write_request(Priority::Visible, RequestBody::Forget { id: id.to_owned() }, None).await? {
+            Response::End => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Creates a client without connecting.
     pub fn new(cfg: Config) -> Result<Self> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());

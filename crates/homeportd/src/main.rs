@@ -127,7 +127,9 @@ async fn run(args: Args) -> Result<(), MainError> {
     }
     let stored_event = loaded.last_event_id;
     let stored_uuid = loaded.volume_uuid.clone();
-    let index = Arc::new(index::Index::new(shares, db.clone(), loaded, args.cache_dirs)?);
+    let writes = index::WriteDirs::prepare(data_dir.join("staging"), home.join(".Trash"))
+        .map_err(|source| tls::TlsError::Io { path: data_dir.join("staging").display().to_string(), source })?;
+    let index = Arc::new(index::Index::new(shares, db.clone(), loaded, args.cache_dirs, writes)?);
     for s in index.shares() {
         tracing::info!(share = %s.name, path = %s.path.display(), "share");
     }
