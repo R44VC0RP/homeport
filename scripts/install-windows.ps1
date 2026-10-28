@@ -63,7 +63,10 @@ $Cli = Join-Path $InstallDir 'homeport.exe'
 # turns a native program's stderr into errors under -ErrorAction Stop.)
 function Invoke-Native {
     $ErrorActionPreference = 'Continue'
-    $exe, $rest = $args
+    # @(...): with one argument, `$exe, $rest = $args` makes $rest a string,
+    # and splatting a string passes its characters.
+    $exe = $args[0]
+    $rest = @($args | Select-Object -Skip 1)
     & $exe @rest 2>&1 | ForEach-Object { "$_" } | Out-String
 }
 
@@ -182,7 +185,7 @@ try {
         Copy-Item -Force $newCli $Cli
         Unblock-File $Cli
     }
-    Write-Host "Installed $((Invoke-Native $Exe '--version').Trim()) in $InstallDir"
+    Write-Host "Installed $((Invoke-Native $Exe --version).Trim()) in $InstallDir"
 } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
 }
@@ -244,7 +247,7 @@ if (-not $NoService) {
     }
 }
 Write-Host ''
-$null = Invoke-Native $Exe pair '--help'
+$null = Invoke-Native $Exe pair --help
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Next: run '& `"$Exe`" pair' and open the link it prints on your Mac (or enter its 6-digit code in Homeport)."
 } else {
