@@ -1,0 +1,17 @@
+[package]
+name = "homeport-proto"
+description = "Homeport wire protocol: request and response types and framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
