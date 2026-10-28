@@ -330,6 +330,15 @@ async fn run(args: Args) -> Result<(), CliError> {
             writeln!(out, "loss       {:.2} %", l.loss * 100.0)?;
             writeln!(out, "probes     {} ({} missed)", l.probes, l.misses)?;
             if let Some(h) = h {
+                let sv = &h.server;
+                writeln!(out, "server os  {} ({:?}, homeportd {})", sv.name, sv.os, sv.version)?;
+                writeln!(
+                    out,
+                    "names      case-{} normalization-{}",
+                    if sv.case_sensitive { "sensitive" } else { "insensitive" },
+                    if sv.normalization_sensitive { "sensitive" } else { "insensitive" }
+                )?;
+                writeln!(out, "caps       {:#x}", sv.caps)?;
                 writeln!(out, "index      {} seq {}", h.index_id, h.seq)?;
                 let roots: Vec<_> = h.roots.iter().map(|r| r.id.as_str()).collect();
                 writeln!(out, "roots      {}", roots.join(", "))?;

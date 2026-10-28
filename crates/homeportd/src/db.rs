@@ -1,18 +1,29 @@
 //! SQLite persistence for the index. One writer thread owns the write
 //! connection and batches operations into transactions; reads use a separate
 //! WAL connection.
+//!
+//! Schema 3 (protocol 3) adds raw names (`items.name_raw`), file keys
+//! (`items.fkey`), the `ids` table (key → item id for platforms whose ids the
+//! index assigns), the trash path of trashed items, and meta keys
+//! `id_scheme`, `vol_slots`, `next_id` and `watch_cursor`. A schema-2
+//! database is upgraded in place (ids and `index_id` kept, so clients keep
+//! their state); a database written under another id scheme is reset with a
+//! new `index_id`, so clients get `SyncAnchorExpired` and re-enumerate.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use homeport_proto::{Deleted, Item, Kind};
+use homeport_proto::{Deleted, Item, Kind, item_flags};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::{oneshot, watch};
 
+use crate::platform::{FileKey, IdScheme, RawName};
+
 /// Tombstones kept for `Changes`; older anchors get `SyncAnchorExpired`.
 const TOMBSTONE_KEEP: i64 = 200_000;
+const SCHEMA: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -24,27 +35,71 @@ pub enum DbError {
     Poisoned,
 }
 
-/// An item a client moved to basebook's Trash and can put back.
+/// An indexed item: what clients see plus what only the server needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub item: Item,
+    /// OS identity hint (unset for rows from schema 2).
+    pub key: FileKey,
+    /// Name on disk (`item.name` is the display name).
+    pub raw: RawName,
+}
+
+/// An item a client moved to the server's Trash and can put back.
 #[derive(Clone, Debug)]
 pub struct Trashed {
     pub orig_parent: String,
     pub orig_name: String,
     /// The item as the trash container lists it.
     pub item: Item,
+    /// Where it went (used when the platform cannot resolve keys).
+    pub path: Option<PathBuf>,
 }
 
 pub enum Op {
-    Listing { dir_id: String, dir_rev: u64, path: PathBuf, upserts: Vec<Item>, removed: Vec<String>, seq: u64 },
+    Listing {
+        dir_id: String,
+        dir_rev: u64,
+        path: PathBuf,
+        upserts: Vec<Row>,
+        removed: Vec<String>,
+        seq: u64,
+    },
     /// A create (keyed by the client's op id) made `file_id`.
-    CreateDone { op_id: String, file_id: String },
+    CreateDone {
+        op_id: String,
+        file_id: String,
+    },
     /// An item entered the trash container (its row moves under `TRASH_ID`).
-    TrashSet { id: String, trashed: Trashed, seq: u64 },
+    TrashSet {
+        id: String,
+        trashed: Trashed,
+        seq: u64,
+    },
     /// An item left the trash container; with `tombstone`, it is gone for clients.
-    TrashForget { id: String, tombstone: bool, seq: u64 },
-    DropDir { dir_id: String, seq: u64 },
-    Have { client_id: String, dir_id: String },
-    EventId(u64),
-    VolumeUuid(String),
+    TrashForget {
+        id: String,
+        tombstone: bool,
+        seq: u64,
+    },
+    DropDir {
+        dir_id: String,
+        seq: u64,
+    },
+    Have {
+        client_id: String,
+        dir_id: String,
+    },
+    /// An assigned item id now names this key.
+    IdSet {
+        id: u64,
+        key: FileKey,
+    },
+    WatchCursor(String),
+    Meta {
+        key: &'static str,
+        value: String,
+    },
     Flush(oneshot::Sender<()>),
 }
 
@@ -56,8 +111,11 @@ pub struct Loaded {
     pub index_id: u64,
     pub seq: u64,
     pub tombstone_floor: u64,
-    pub last_event_id: Option<u64>,
-    pub volume_uuid: Option<String>,
+    pub watch_cursor: Option<String>,
+    /// Stable volume ids by slot (direct ids).
+    pub vol_slots: Vec<String>,
+    /// Next assigned item id.
+    pub next_id: u64,
     pub dirs: HashMap<String, (u64, PathBuf)>,
     pub have: HashMap<String, HashSet<String>>,
     /// Recent creates: client op id -> file id.
@@ -99,6 +157,19 @@ fn kind_from_i(i: i64) -> Kind {
     }
 }
 
+/// Paths are stored as raw OS bytes.
+fn path_bytes(p: &Path) -> Vec<u8> {
+    RawName(p.as_os_str().to_owned()).to_bytes()
+}
+
+fn path_from(v: rusqlite::types::Value) -> PathBuf {
+    match v {
+        rusqlite::types::Value::Blob(b) => PathBuf::from(RawName::from_bytes(&b).0),
+        rusqlite::types::Value::Text(t) => PathBuf::from(t),
+        _ => PathBuf::new(),
+    }
+}
+
 fn row_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     Ok(Item {
         id: r.get(0)?,
@@ -112,13 +183,25 @@ fn row_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         rev: r.get::<_, i64>(8)? as u64,
         content_rev: r.get::<_, i64>(9)? as u64,
         crtime_ns: r.get(10)?,
-        flags: r.get::<_, i64>(11)? as u32,
+        // Schema 2 stored every BSD flag.
+        flags: r.get::<_, i64>(11)? as u32 & item_flags::ALL,
         tags: r.get(12)?,
     })
 }
 
+fn row_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
+    let item = row_item(r)?;
+    let raw = match r.get::<_, Option<Vec<u8>>>(13)? {
+        Some(b) => RawName::from_bytes(&b),
+        None => RawName(item.name.clone().into()),
+    };
+    let key = r.get::<_, Option<Vec<u8>>>(14)?.and_then(|b| FileKey::decode(&b)).unwrap_or_default();
+    Ok(Row { item, key, raw })
+}
+
 const ITEM_COLS: &str =
     "file_id, parent_id, name, kind, size, mtime_ns, ctime_ns, mode, rev, content_rev, crtime_ns, flags, tags";
+const ROW_COLS: &str = "file_id, parent_id, name, kind, size, mtime_ns, ctime_ns, mode, rev, content_rev, crtime_ns, flags, tags, name_raw, fkey";
 
 /// Ops older than this are forgotten (a client retrying later gets a collision instead).
 const OP_KEEP_NS: i64 = 7 * 24 * 3600 * 1_000_000_000;
@@ -129,15 +212,17 @@ fn now_ns() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
-fn upsert_item(conn: &Connection, it: &Item) -> rusqlite::Result<()> {
+fn upsert_row(conn: &Connection, row: &Row) -> rusqlite::Result<()> {
+    let it = &row.item;
+    let key = (!row.key.is_unset()).then(|| row.key.encode());
     conn.prepare_cached(
-        "INSERT INTO items(file_id, parent_id, name, kind, size, mtime_ns, ctime_ns, mode, rev, content_rev, crtime_ns, flags, tags)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "INSERT INTO items(file_id, parent_id, name, kind, size, mtime_ns, ctime_ns, mode, rev, content_rev, crtime_ns, flags, tags, name_raw, fkey)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(file_id) DO UPDATE SET parent_id = excluded.parent_id, name = excluded.name,
            kind = excluded.kind, size = excluded.size, mtime_ns = excluded.mtime_ns,
            ctime_ns = excluded.ctime_ns, mode = excluded.mode, rev = excluded.rev,
            content_rev = excluded.content_rev, crtime_ns = excluded.crtime_ns, flags = excluded.flags,
-           tags = excluded.tags",
+           tags = excluded.tags, name_raw = excluded.name_raw, fkey = excluded.fkey",
     )?
     .execute(params![
         it.id,
@@ -152,7 +237,9 @@ fn upsert_item(conn: &Connection, it: &Item) -> rusqlite::Result<()> {
         it.content_rev as i64,
         it.crtime_ns,
         i64::from(it.flags),
-        it.tags
+        it.tags,
+        row.raw.to_bytes(),
+        key
     ])?;
     Ok(())
 }
@@ -169,8 +256,77 @@ fn meta_set(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
+    conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), [col], |r| {
+        r.get::<_, i64>(0).map(|n| n > 0)
+    })
+}
+
+fn scheme_name(s: IdScheme) -> &'static str {
+    match s {
+        IdScheme::Direct => "direct",
+        IdScheme::Assigned => "assigned",
+    }
+}
+
+fn new_index_id(conn: &Connection) -> rusqlite::Result<u64> {
+    let id: u64 = rand::random::<u64>() >> 1;
+    meta_set(conn, "index_id", &id.to_string())?;
+    Ok(id)
+}
+
+/// Upgrades older schemas in place.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    // Columns added with protocol 2. Old rows keep crtime 0 ("unknown").
+    if !has_column(conn, "items", "crtime_ns")? {
+        conn.execute_batch(
+            "ALTER TABLE items ADD COLUMN crtime_ns INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE items ADD COLUMN flags INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE items ADD COLUMN tags BLOB;",
+        )?;
+    }
+    // Protocol 3. Rows without a raw name use `name`; keys are filled in by rescans.
+    if !has_column(conn, "items", "name_raw")? {
+        conn.execute_batch(
+            "ALTER TABLE items ADD COLUMN name_raw BLOB;
+             ALTER TABLE items ADD COLUMN fkey BLOB;",
+        )?;
+    }
+    if !has_column(conn, "trashed", "trash_path")? {
+        conn.execute_batch("ALTER TABLE trashed ADD COLUMN trash_path BLOB;")?;
+    }
+    // The FSEvents id and volume became one opaque watcher cursor.
+    if meta_get(conn, "watch_cursor")?.is_none()
+        && let (Some(uuid), Some(id)) = (meta_get(conn, "volume_uuid")?, meta_get(conn, "last_event_id")?)
+    {
+        meta_set(conn, "watch_cursor", &format!("{uuid}:{id}"))?;
+    }
+    // Schema-2 databases come from macOS servers, whose ids were direct and
+    // whose shares were all on one volume (slot 0).
+    if meta_get(conn, "id_scheme")?.is_none() && meta_get(conn, "index_id")?.is_some() {
+        meta_set(conn, "id_scheme", "direct")?;
+        if meta_get(conn, "vol_slots")?.is_none()
+            && let Some(uuid) = meta_get(conn, "volume_uuid")?
+        {
+            meta_set(conn, "vol_slots", &uuid)?;
+        }
+    }
+    meta_set(conn, "schema", &SCHEMA.to_string())
+}
+
+/// Forgets every item (ids from another scheme mean nothing now).
+fn reset(conn: &Connection, scheme: IdScheme) -> rusqlite::Result<u64> {
+    conn.execute_batch(
+        "DELETE FROM items; DELETE FROM dirs; DELETE FROM tombstones; DELETE FROM have;
+         DELETE FROM ops; DELETE FROM trashed; DELETE FROM ids;
+         DELETE FROM meta WHERE key IN ('vol_slots', 'next_id', 'tombstone_floor');",
+    )?;
+    meta_set(conn, "id_scheme", scheme_name(scheme))?;
+    new_index_id(conn)
+}
+
 impl Db {
-    pub fn open(path: &Path) -> Result<(Arc<Self>, Loaded), DbError> {
+    pub fn open(path: &Path, scheme: IdScheme) -> Result<(Arc<Self>, Loaded), DbError> {
         let conn = open(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -186,28 +342,26 @@ impl Db {
              CREATE INDEX IF NOT EXISTS tombstones_seq ON tombstones(seq);
              CREATE TABLE IF NOT EXISTS have(client_id TEXT NOT NULL, dir_id TEXT NOT NULL, PRIMARY KEY(client_id, dir_id)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS ops(op_id TEXT PRIMARY KEY, file_id TEXT NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS trashed(file_id TEXT PRIMARY KEY, orig_parent TEXT NOT NULL, orig_name TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS trashed(file_id TEXT PRIMARY KEY, orig_parent TEXT NOT NULL, orig_name TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS ids(item_id INTEGER PRIMARY KEY, fkey BLOB NOT NULL);
+             CREATE UNIQUE INDEX IF NOT EXISTS ids_key ON ids(fkey);",
         )?;
-        // Columns added with protocol 2. Old rows keep crtime 0 ("unknown").
-        let has_crtime: bool =
-            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'crtime_ns'", [], |r| {
-                r.get::<_, i64>(0).map(|n| n > 0)
-            })?;
-        if !has_crtime {
-            conn.execute_batch(
-                "ALTER TABLE items ADD COLUMN crtime_ns INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE items ADD COLUMN flags INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE items ADD COLUMN tags BLOB;",
-            )?;
-        }
+        migrate(&conn)?;
         conn.execute("DELETE FROM ops WHERE at < ?1", [now_ns() - OP_KEEP_NS])?;
 
         let index_id = match meta_get(&conn, "index_id")?.and_then(|v| v.parse().ok()) {
-            Some(id) => id,
-            None => {
-                let id: u64 = rand::random::<u64>() >> 1;
-                meta_set(&conn, "index_id", &id.to_string())?;
+            Some(id) if meta_get(&conn, "id_scheme")?.as_deref() == Some(scheme_name(scheme)) => id,
+            Some(_) => {
+                let id = reset(&conn, scheme)?;
+                tracing::warn!(
+                    scheme = scheme_name(scheme),
+                    "item id scheme changed; index reset (clients re-enumerate)"
+                );
                 id
+            }
+            None => {
+                meta_set(&conn, "id_scheme", scheme_name(scheme))?;
+                new_index_id(&conn)?
             }
         };
         let stored_seq: u64 = meta_get(&conn, "seq")?.and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -215,6 +369,11 @@ impl Db {
         // before an unclean exit is never reused for a different change.
         let seq = stored_seq + 1000;
         meta_set(&conn, "seq", &seq.to_string())?;
+        // Same for assigned ids.
+        let next_id = meta_get(&conn, "next_id")?.and_then(|v| v.parse::<u64>().ok()).map_or(0, |n| n + 1000);
+        if next_id > 0 {
+            meta_set(&conn, "next_id", &next_id.to_string())?;
+        }
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))?;
         if count > TOMBSTONE_KEEP {
@@ -227,17 +386,20 @@ impl Db {
             meta_set(&conn, "tombstone_floor", &cut.to_string())?;
         }
         let tombstone_floor = meta_get(&conn, "tombstone_floor")?.and_then(|v| v.parse().ok()).unwrap_or(0);
-        let last_event_id = meta_get(&conn, "last_event_id")?.and_then(|v| v.parse().ok());
-        let volume_uuid = meta_get(&conn, "volume_uuid")?;
+        let watch_cursor = meta_get(&conn, "watch_cursor")?;
+        let vol_slots = meta_get(&conn, "vol_slots")?
+            .map(|v| v.split('\n').filter(|s| !s.is_empty()).map(str::to_owned).collect())
+            .unwrap_or_default();
 
         let mut dirs = HashMap::new();
         {
             let mut st = conn.prepare("SELECT dir_id, dir_rev, path FROM dirs")?;
-            let rows =
-                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, String>(2)?)))?;
+            let rows = st.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, rusqlite::types::Value>(2)?))
+            })?;
             for row in rows {
                 let (id, rev, path) = row?;
-                dirs.insert(id, (rev, PathBuf::from(path)));
+                dirs.insert(id, (rev, path_from(path)));
             }
         }
         let mut have: HashMap<String, HashSet<String>> = HashMap::new();
@@ -261,11 +423,16 @@ impl Db {
         let mut trashed = HashMap::new();
         {
             let mut st = conn.prepare(&format!(
-                "SELECT {}, t.orig_parent, t.orig_name FROM trashed t JOIN items i ON i.file_id = t.file_id",
+                "SELECT {}, t.orig_parent, t.orig_name, t.trash_path FROM trashed t JOIN items i ON i.file_id = t.file_id",
                 ITEM_COLS.split(", ").map(|c| format!("i.{c}")).collect::<Vec<_>>().join(", ")
             ))?;
             let rows = st.query_map([], |r| {
-                Ok(Trashed { item: row_item(r)?, orig_parent: r.get(13)?, orig_name: r.get(14)? })
+                Ok(Trashed {
+                    item: row_item(r)?,
+                    orig_parent: r.get(13)?,
+                    orig_name: r.get(14)?,
+                    path: r.get::<_, Option<rusqlite::types::Value>>(15)?.map(path_from),
+                })
             })?;
             for row in rows {
                 let t = row?;
@@ -286,7 +453,8 @@ impl Db {
             writer: Mutex::new(Some(writer)),
             committed,
         });
-        let loaded = Loaded { index_id, seq, tombstone_floor, last_event_id, volume_uuid, dirs, have, ops, trashed };
+        let loaded =
+            Loaded { index_id, seq, tombstone_floor, watch_cursor, vol_slots, next_id, dirs, have, ops, trashed };
         Ok((db, loaded))
     }
 
@@ -318,17 +486,36 @@ impl Db {
         Ok(f(&conn)?)
     }
 
-    pub fn dir_items(&self, dir_id: &str) -> Result<Vec<Item>, DbError> {
+    pub fn dir_rows(&self, dir_id: &str) -> Result<Vec<Row>, DbError> {
         self.with_read(|c| {
-            let mut st = c.prepare_cached(&format!("SELECT {ITEM_COLS} FROM items WHERE parent_id = ?1"))?;
-            st.query_map([dir_id], row_item)?.collect()
+            let mut st = c.prepare_cached(&format!("SELECT {ROW_COLS} FROM items WHERE parent_id = ?1"))?;
+            st.query_map([dir_id], row_row)?.collect()
         })
     }
 
-    pub fn item(&self, id: &str) -> Result<Option<Item>, DbError> {
+    pub fn row(&self, id: &str) -> Result<Option<Row>, DbError> {
         self.with_read(|c| {
-            let mut st = c.prepare_cached(&format!("SELECT {ITEM_COLS} FROM items WHERE file_id = ?1"))?;
-            st.query_row([id], row_item).optional()
+            let mut st = c.prepare_cached(&format!("SELECT {ROW_COLS} FROM items WHERE file_id = ?1"))?;
+            st.query_row([id], row_row).optional()
+        })
+    }
+
+    /// Assigned item id of a key.
+    pub fn id_of_key(&self, key: &FileKey) -> Result<Option<u64>, DbError> {
+        self.with_read(|c| {
+            c.prepare_cached("SELECT item_id FROM ids WHERE fkey = ?1")?
+                .query_row([key.encode()], |r| r.get::<_, i64>(0).map(|v| v as u64))
+                .optional()
+        })
+    }
+
+    /// Key of an assigned item id.
+    pub fn key_of_id(&self, id: u64) -> Result<Option<FileKey>, DbError> {
+        self.with_read(|c| {
+            c.prepare_cached("SELECT fkey FROM ids WHERE item_id = ?1")?
+                .query_row([id as i64], |r| r.get::<_, Vec<u8>>(0))
+                .optional()
+                .map(|b| b.and_then(|b| FileKey::decode(&b)))
         })
     }
 
@@ -358,8 +545,8 @@ impl Db {
 fn apply(conn: &Connection, op: &Op, max_seq: &mut u64) -> rusqlite::Result<()> {
     match op {
         Op::Listing { dir_id, dir_rev, path, upserts, removed, seq } => {
-            for it in upserts {
-                upsert_item(conn, it)?;
+            for row in upserts {
+                upsert_row(conn, row)?;
             }
             let mut del = conn.prepare_cached("DELETE FROM items WHERE file_id = ?1 AND parent_id = ?2")?;
             let mut tomb =
@@ -372,7 +559,7 @@ fn apply(conn: &Connection, op: &Op, max_seq: &mut u64) -> rusqlite::Result<()> 
                 "INSERT INTO dirs(dir_id, dir_rev, path) VALUES (?1, ?2, ?3)
                  ON CONFLICT(dir_id) DO UPDATE SET dir_rev = excluded.dir_rev, path = excluded.path",
             )?
-            .execute(params![dir_id, *dir_rev as i64, path.to_string_lossy()])?;
+            .execute(params![dir_id, *dir_rev as i64, path_bytes(path)])?;
             *max_seq = (*max_seq).max(*seq);
         }
         Op::DropDir { dir_id, seq } => {
@@ -390,9 +577,21 @@ fn apply(conn: &Connection, op: &Op, max_seq: &mut u64) -> rusqlite::Result<()> 
                 .execute(params![op_id, file_id, now_ns()])?;
         }
         Op::TrashSet { id, trashed, seq } => {
-            upsert_item(conn, &trashed.item)?;
-            conn.prepare_cached("INSERT OR REPLACE INTO trashed(file_id, orig_parent, orig_name) VALUES (?1, ?2, ?3)")?
-                .execute(params![id, trashed.orig_parent, trashed.orig_name])?;
+            let row = Row {
+                item: trashed.item.clone(),
+                key: FileKey::default(),
+                raw: RawName(trashed.item.name.clone().into()),
+            };
+            upsert_row(conn, &row)?;
+            conn.prepare_cached(
+                "INSERT OR REPLACE INTO trashed(file_id, orig_parent, orig_name, trash_path) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                id,
+                trashed.orig_parent,
+                trashed.orig_name,
+                trashed.path.as_deref().map(path_bytes)
+            ])?;
             *max_seq = (*max_seq).max(*seq);
         }
         Op::TrashForget { id, tombstone, seq } => {
@@ -405,8 +604,18 @@ fn apply(conn: &Connection, op: &Op, max_seq: &mut u64) -> rusqlite::Result<()> 
             }
             *max_seq = (*max_seq).max(*seq);
         }
-        Op::EventId(id) => meta_set(conn, "last_event_id", &id.to_string())?,
-        Op::VolumeUuid(u) => meta_set(conn, "volume_uuid", u)?,
+        Op::IdSet { id, key } => {
+            let k = key.encode();
+            // A key belongs to one id: an older id that had it loses it.
+            conn.prepare_cached("DELETE FROM ids WHERE fkey = ?1 AND item_id != ?2")?
+                .execute(params![k, *id as i64])?;
+            conn.prepare_cached(
+                "INSERT INTO ids(item_id, fkey) VALUES (?1, ?2) ON CONFLICT(item_id) DO UPDATE SET fkey = excluded.fkey",
+            )?
+            .execute(params![*id as i64, k])?;
+        }
+        Op::WatchCursor(c) => meta_set(conn, "watch_cursor", c)?,
+        Op::Meta { key, value } => meta_set(conn, key, value)?,
         Op::Flush(_) => {}
     }
     Ok(())

@@ -1,47 +1,45 @@
 //! Client writes: creates, content updates, renames and moves, Trash.
 //!
-//! Every operation resolves items by file ID, works through descriptors of
-//! the directories involved (`*at` calls that never follow a symlink in the
+//! Every operation resolves items by id, works through handles of the
+//! directories involved (`*at`-style calls that never follow a symlink in the
 //! last component), holds those directories' locks, and records its own
-//! result in the index (with a new seq) before answering. The FSEvents rescan
-//! that follows then finds nothing new, so a client's write never comes back
-//! to it as a remote change.
+//! result in the index (with a new seq) before answering. The rescan the
+//! watcher triggers then finds nothing new, so a client's write never comes
+//! back to it as a remote change.
+//!
+//! Names from clients are display names: they become raw names through
+//! `RawName::from_display`, and a name equal to an item's current (possibly
+//! aliased) display name means "keep the raw name". On filesystems that tell
+//! case or normalization apart, a name that folds to a sibling's is a
+//! collision even though the filesystem would accept it.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::ffi::OsStr;
 
 use homeport_proto::Meta;
 
 use super::*;
-use crate::fsops::{Dir, SetMeta, Sync};
+use crate::platform::{Durability, SetMeta, Sys, SysOps, same_content};
 
-/// Where uploads land and where deletes go.
-#[derive(Clone, Debug)]
-pub struct WriteDirs {
-    /// Uploads are received here; on the shares' volume so they can be renamed into place.
-    pub staging: PathBuf,
-    /// basebook's Trash (`~/.Trash`).
-    pub trash: PathBuf,
-}
+/// Per-share staging directory, used when a share is not on the state
+/// directory's volume. Hidden from listings.
+pub const STAGING_NAME: &str = ".homeport-staging";
 
-impl WriteDirs {
-    /// Creates the staging directory and clears uploads left by a previous run.
-    pub fn prepare(staging: PathBuf, trash: PathBuf) -> io::Result<Self> {
-        std::fs::create_dir_all(&staging)?;
-        std::fs::create_dir_all(&trash)?;
-        for e in std::fs::read_dir(&staging)?.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("up-") {
-                let _ = std::fs::remove_file(e.path());
-            } else if name.starts_with("backup-") {
-                // A content write did not finish: its target may be partial.
-                tracing::warn!(path = %e.path().display(), "backup of an interrupted write left in staging");
-            }
+/// Creates a staging directory and clears uploads left by a previous run.
+pub fn clear_staging(staging: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(staging)?;
+    for e in std::fs::read_dir(staging)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("up-") {
+            let _ = std::fs::remove_file(e.path());
+        } else if name.starts_with("backup-") {
+            // A content write did not finish: its target may be partial.
+            tracing::warn!(path = %e.path().display(), "backup of an interrupted write left in staging");
         }
-        Ok(Self { staging, trash: std::fs::canonicalize(&trash)? })
     }
+    Ok(())
 }
 
-/// A received upload in the staging directory; removed on drop if still there.
+/// A received upload in a staging directory; removed on drop if still there.
 pub struct Staged {
     pub dir: PathBuf,
     pub name: String,
@@ -55,6 +53,10 @@ impl Staged {
 
     pub fn path(&self) -> PathBuf {
         self.dir.join(&self.name)
+    }
+
+    fn os_name(&self) -> &OsStr {
+        OsStr::new(&self.name)
     }
 }
 
@@ -70,6 +72,8 @@ struct Upsert {
     tags: Option<Vec<u8>>,
     /// `None`: the content changed (a new content rev).
     content_rev: Option<u64>,
+    /// The item's id when known (it stays even if the file key changed).
+    id: Option<ItemId>,
 }
 
 enum Created {
@@ -106,14 +110,11 @@ fn set_meta(m: &Meta) -> SetMeta<'_> {
 }
 
 fn io_err(e: io::Error) -> IndexError {
-    match e.raw_os_error() {
-        Some(libc::EINVAL) => IndexError::BadName,
-        _ => IndexError::from_io(e),
-    }
+    IndexError::from_io(e)
 }
 
 fn is_exists(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EEXIST)
+    Fs::classify(e) == ErrKind::Exists
 }
 
 /// `name` with ` (suffix)` before its extension: `a.txt` -> `a (suffix).txt`.
@@ -124,37 +125,17 @@ fn with_suffix(name: &str, suffix: &str) -> String {
     }
 }
 
-/// Local time as `YYYY-MM-DD HHMM`.
-fn local_stamp() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as libc::time_t;
-    // SAFETY: zeroed `tm` is a valid out-parameter.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&secs, &mut tm) };
-    format!("{:04}-{:02}-{:02} {:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)
-}
-
 fn conflict_name(name: &str, device: &str, n: u32) -> String {
     let device = if device.is_empty() { "client" } else { device };
-    let suffix = format!("{device} conflict {}", local_stamp());
+    let suffix = format!("{device} conflict {}", Sys::local_stamp());
     if n <= 1 { with_suffix(name, &suffix) } else { with_suffix(name, &format!("{suffix} {n}")) }
 }
 
-/// Finder-style names for the Trash: `a.txt`, `a 2.txt`, `a 3.txt`, ...
-fn trash_name(name: &str, n: u32) -> String {
-    if n <= 1 {
-        return name.to_owned();
-    }
-    match name.rfind('.') {
-        Some(i) if i > 0 => format!("{} {n}{}", &name[..i], &name[i..]),
-        _ => format!("{name} {n}"),
-    }
-}
-
 /// Renames `from` in `src` to the first free name `name_for(n)` in `dst`.
-fn rename_free(src: &Dir, from: &str, dst: &Dir, name_for: impl Fn(u32) -> String) -> Result<String, IndexError> {
+fn rename_free(src: &Dir, from: &OsStr, dst: &Dir, name_for: impl Fn(u32) -> String) -> Result<RawName, IndexError> {
     for n in 1..1000 {
-        let to = name_for(n);
-        match src.rename_excl(from, dst, &to) {
+        let to = RawName::from_display(&name_for(n))?;
+        match src.rename_noreplace(from, dst, to.as_os_str()) {
             Ok(()) => return Ok(to),
             Err(e) if is_exists(&e) => continue,
             Err(e) => return Err(io_err(e)),
@@ -163,13 +144,27 @@ fn rename_free(src: &Dir, from: &str, dst: &Dir, name_for: impl Fn(u32) -> Strin
     Err(IndexError::Io(io::Error::other("no free name")))
 }
 
-fn file_name(path: &Path) -> Result<String, IndexError> {
-    path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or(IndexError::NotFound)
+fn raw_of(path: &Path) -> Result<RawName, IndexError> {
+    RawName::of_path(path).ok_or(IndexError::NotFound)
+}
+
+/// A sibling (other than `except`) whose name folds like `name`.
+fn fold_collision<'a>(rows: &'a [Row], name: &str, except: Option<&str>) -> Option<&'a Row> {
+    let key = names::fold_key(name);
+    rows.iter().find(|r| Some(r.item.id.as_str()) != except && names::fold_key(&r.item.name) == key)
 }
 
 impl Index {
-    pub fn staging_dir(&self) -> &Path {
-        &self.writes.staging
+    /// Where an upload for an item in (or into) `id` should be received.
+    pub fn staging_for(&self, id: &str) -> PathBuf {
+        let share = match self.canonical(id).strip_prefix(proto::SHARE_ID_PREFIX) {
+            Some(name) => self.shares.iter().position(|s| s.name == name),
+            None => match self.resolve(id) {
+                Ok(Target::Path { share, .. }) => Some(share),
+                _ => None,
+            },
+        };
+        share.map_or_else(|| self.writes.staging.clone(), |s| self.shares[s].staging.clone())
     }
 
     /// The item an earlier create with this op id made, if any.
@@ -188,11 +183,11 @@ impl Index {
         Ok(())
     }
 
-    /// File ID of a directory item (share roots have `root:` IDs).
-    fn dir_ino(&self, id: &str) -> Option<u64> {
+    /// File key of a directory item (share roots have `root:` IDs).
+    fn dir_key(&self, id: &str) -> Option<FileKey> {
         match id.strip_prefix(proto::SHARE_ID_PREFIX) {
-            Some(name) => self.shares.iter().find(|s| s.name == name).map(|s| s.ino),
-            None => id.parse().ok(),
+            Some(name) => self.shares.iter().find(|s| s.name == name).map(|s| s.key),
+            None => self.key_of(id).ok(),
         }
     }
 
@@ -208,22 +203,24 @@ impl Index {
         }
     }
 
-    /// Current items of a directory, indexing it first if needed. Call with its lock held.
-    async fn prepare_dir(self: &Arc<Self>, dir_id: &str) -> Result<Vec<Item>, IndexError> {
+    fn trash_impl(&self) -> Result<&Trash, IndexError> {
+        self.writes.trash.as_ref().ok_or_else(|| IndexError::Unsupported("this server has no trash".into()))
+    }
+
+    /// Current rows of a directory, indexing it first if needed. Call with its lock held.
+    async fn prepare_dir(self: &Arc<Self>, dir_id: &str) -> Result<Vec<Row>, IndexError> {
         let (cached, indexed) = {
             let mut st = self.state()?;
             (st.lru.get(dir_id).cloned(), st.indexed.contains_key(dir_id))
         };
         if let Some(l) = cached {
-            return Ok(l.items.clone());
+            return Ok(l.rows.clone());
         }
         if indexed {
             self.db.flush().await?;
-            let (listing, _) = self.refresh_locked(dir_id, false).await?;
-            return Ok(listing.items.clone());
         }
         let (listing, _) = self.refresh_locked(dir_id, false).await?;
-        Ok(listing.items.clone())
+        Ok(listing.rows.clone())
     }
 
     /// Records changes the server made itself in `dir_id` (whose lock the
@@ -232,39 +229,73 @@ impl Index {
         &self,
         dir_id: &str,
         dir_path: &Path,
-        mut items: Vec<Item>,
+        mut rows: Vec<Row>,
         ups: Vec<Upsert>,
         removed: &[ItemId],
     ) -> Result<Vec<Item>, IndexError> {
+        // Ids first: they may need the database.
+        let mut fresh = Vec::with_capacity(ups.len());
+        for u in ups {
+            if Fs::skip(u.entry.name.as_os_str()) {
+                continue;
+            }
+            let id = match u.id {
+                Some(id) => {
+                    if let Ok(n) = id.parse::<u64>()
+                        && self.ids.scheme() == IdScheme::Assigned
+                    {
+                        self.ids.repoint(n, &u.entry.key)?;
+                    }
+                    id
+                }
+                None => self.id_for(&u.entry.key)?,
+            };
+            let content_rev = u.content_rev;
+            fresh.push((row_of(id, dir_id, u.entry, u.tags), content_rev));
+        }
+        let aliases = self.share_of(dir_path).is_some_and(|s| self.shares[s].needs_aliases());
         let mut st = self.state()?;
         st.seq += 1;
         let seq = st.seq;
-        items.retain(|i| !removed.contains(&i.id));
-        let mut out = Vec::with_capacity(ups.len());
-        for u in ups {
-            if u.entry.name == ".DS_Store" {
-                continue;
+        rows.retain(|r| !removed.contains(&r.item.id));
+        let mut out_ids: Vec<ItemId> = Vec::with_capacity(fresh.len());
+        for (mut row, content_rev) in fresh {
+            row.item.rev = seq;
+            row.item.content_rev = content_rev.unwrap_or(seq);
+            out_ids.push(row.item.id.clone());
+            match rows.iter().position(|r| r.item.id == row.item.id) {
+                Some(p) => rows[p] = row,
+                None => rows.push(row),
             }
-            let id = self.id_for(u.entry.ino);
-            let mut item = item_of(id, dir_id, u.entry, u.tags);
-            item.rev = seq;
-            item.content_rev = u.content_rev.unwrap_or(seq);
-            match items.iter().position(|i| i.id == item.id) {
-                Some(p) => items[p] = item.clone(),
-                None => items.push(item.clone()),
-            }
-            out.push(item);
         }
-        items.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        let listing = Arc::new(encode_listing(dir_id, seq, items)?);
+        if aliases {
+            // A new name can alias (or un-alias) a sibling: that is a change too.
+            for i in apply_aliases(&mut rows) {
+                if !out_ids.contains(&rows[i].item.id) {
+                    rows[i].item.rev = seq;
+                    out_ids.push(rows[i].item.id.clone());
+                }
+            }
+        }
+        let upserts: Vec<Row> =
+            out_ids.iter().filter_map(|id| rows.iter().find(|r| r.item.id == *id).cloned()).collect();
+        rows.sort_unstable_by(|a, b| a.item.name.cmp(&b.item.name));
+        let listing = Arc::new(encode_listing(dir_id, seq, rows));
         st.lru.put(dir_id.to_owned(), listing);
-        st.indexed.insert(dir_id.to_owned(), (seq, dir_path.to_owned()));
+        let prev = st.indexed.insert(dir_id.to_owned(), (seq, dir_path.to_owned()));
+        if prev.is_none()
+            && let Some(w) = self.watcher.get()
+        {
+            w.watch_dir(dir_path);
+        }
+        self.note_locations(&upserts);
+        let out = upserts.iter().map(|r| r.item.clone()).collect();
         // Sent under the state lock so the writer sees seqs in order.
         self.db.send(Op::Listing {
             dir_id: dir_id.to_owned(),
             dir_rev: seq,
             path: dir_path.to_owned(),
-            upserts: out.clone(),
+            upserts,
             removed: removed.to_vec(),
             seq,
         })?;
@@ -288,18 +319,22 @@ impl Index {
         f().await
     }
 
-    fn tags_at(path: &Path) -> Option<Vec<u8>> {
-        fsops::get_xattr(path, fsops::TAGS_XATTR).ok().flatten()
-    }
-
     /// The listing's item for an entry, recording it if the index is behind.
-    fn known_or_commit(&self, dir_id: &str, dir_path: &Path, items: Vec<Item>, e: Entry) -> Result<Item, IndexError> {
-        let id = self.id_for(e.ino);
-        if let Some(i) = items.iter().find(|i| i.id == id && i.size == e.size && i.mtime_ns == e.mtime_ns) {
-            return Ok(i.clone());
+    fn known_or_commit(&self, dir_id: &str, dir_path: &Path, rows: Vec<Row>, e: Entry) -> Result<Item, IndexError> {
+        if let Some(id) = self.known_id(&e.key)?
+            && let Some(r) =
+                rows.iter().find(|r| r.item.id == id && r.item.size == e.size && r.item.mtime_ns == e.mtime_ns)
+        {
+            return Ok(r.item.clone());
         }
-        let tags = Self::tags_at(&dir_path.join(&e.name));
-        let mut out = self.commit_local(dir_id, dir_path, items, vec![Upsert { entry: e, tags, content_rev: None }], &[])?;
+        let tags = Fs::tags(&dir_path.join(e.name.as_os_str()));
+        let mut out = self.commit_local(
+            dir_id,
+            dir_path,
+            rows,
+            vec![Upsert { entry: e, tags, content_rev: None, id: None }],
+            &[],
+        )?;
         out.pop().ok_or(IndexError::NotFound)
     }
 
@@ -310,38 +345,42 @@ impl Index {
         staged: Option<Staged>,
         client: Option<&str>,
     ) -> Result<Item, IndexError> {
-        if !proto::valid_name(&req.name) {
-            return Err(IndexError::BadName);
-        }
+        let raw = RawName::from_display(&req.name)?;
         if let Some(id) = self.op_replay(&req.op_id)
             && let Ok(item) = self.stat(&id).await
         {
             return Ok(item);
         }
         let (parent_id, ppath, share) = self.writable_dir(&req.parent_id)?;
-        let pino = self.dir_ino(&parent_id);
+        let pkey = self.dir_key(&parent_id);
         let item = self
             .locked(&[&parent_id], async || {
-                let items = self.prepare_dir(&parent_id).await?;
+                let rows = self.prepare_dir(&parent_id).await?;
+                // A sibling the client would see as the same name (the
+                // filesystem may not): use its raw name so it is found.
+                let raw = match self.shares[share].needs_aliases().then(|| fold_collision(&rows, &req.name, None)) {
+                    Some(Some(r)) => r.raw.clone(),
+                    _ => raw.clone(),
+                };
                 let this = self.clone();
                 let path = ppath.clone();
-                let r = req.name.clone();
                 let kind = req.kind;
                 let target = req.link_target.clone();
                 let meta = req.meta.clone();
                 let may_exist = req.may_exist;
                 let outcome = tokio::task::spawn_blocking(move || -> Result<Created, IndexError> {
-                    let dir = Dir::open(&path, pino).map_err(IndexError::from_io)?;
-                    if let Ok(e) = dir.stat(&r) {
-                        let e = Entry { name: dir.stored_name(&r).unwrap_or(e.name.clone()), ..e };
+                    let r = raw.as_os_str();
+                    let dir = Dir::open(&path, pkey.as_ref()).map_err(IndexError::from_io)?;
+                    if let Ok(e) = dir.stat(r) {
+                        let e = Entry { name: dir.stored_name(r).unwrap_or(e.name.clone()), ..e };
                         let same = may_exist
                             && e.kind == kind
                             && match kind {
                                 Kind::Dir => true,
-                                Kind::File => match (&staged, dir.open_at(&e.name, libc::O_RDONLY, 0)) {
-                                    (Some(s), Ok(cur)) => fsops::open_nofollow(&s.path(), libc::O_RDONLY)
-                                        .and_then(|up| fsops::same_content(&up, &cur))
-                                        .unwrap_or(false),
+                                Kind::File => match (&staged, dir.open_file(e.name.as_os_str(), false)) {
+                                    (Some(s), Ok(cur)) => {
+                                        Fs::open_read(&s.path()).and_then(|up| same_content(&up, &cur)).unwrap_or(false)
+                                    }
                                     _ => false,
                                 },
                                 _ => false,
@@ -349,30 +388,32 @@ impl Index {
                         return Ok(if same { Created::Existing(e) } else { Created::Taken(e) });
                     }
                     let res = match kind {
-                        Kind::Dir => dir.mkdir(&r, 0o755).and_then(|()| {
-                            let fd = dir.open_at(&r, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-                            fsops::apply_meta(&fd, &set_meta(&meta))
-                        }),
+                        Kind::Dir => {
+                            dir.mkdir(r).and_then(|()| dir.open_meta(r, Kind::Dir)?.apply_meta(&set_meta(&meta)))
+                        }
                         Kind::File => {
-                            let s = staged.as_ref().ok_or_else(|| IndexError::BadRequest("file without content".into()))?;
+                            let s =
+                                staged.as_ref().ok_or_else(|| IndexError::BadRequest("file without content".into()))?;
                             let sd = Dir::open(&s.dir, None).map_err(IndexError::from_io)?;
-                            let fd = sd.open_at(&s.name, libc::O_RDONLY, 0).map_err(IndexError::from_io)?;
-                            fsops::apply_meta(&fd, &set_meta(&meta)).map_err(IndexError::from_io)?;
-                            fsops::sync(&fd, Sync::Barrier).map_err(IndexError::from_io)?;
-                            sd.rename_excl(&s.name, &dir, &r)
+                            let fd = sd.open_file(s.os_name(), false).map_err(IndexError::from_io)?;
+                            fd.apply_meta(&set_meta(&meta)).map_err(IndexError::from_io)?;
+                            fd.sync(Durability::Barrier).map_err(IndexError::from_io)?;
+                            sd.rename_noreplace(s.os_name(), &dir, r)
                         }
                         Kind::Symlink => {
-                            let t = target.as_deref().ok_or_else(|| IndexError::BadRequest("symlink without target".into()))?;
+                            let t = target
+                                .as_deref()
+                                .ok_or_else(|| IndexError::BadRequest("symlink without target".into()))?;
                             this.check_link_target(share, &path, t)?;
-                            dir.symlink(t, &r)
+                            dir.symlink(t, r)
                         }
                         Kind::Other => return Err(IndexError::BadRequest("unsupported item kind".into())),
                     };
                     match res {
-                        Ok(()) => Ok(Created::New(dir.stat(&r).map_err(IndexError::from_io)?)),
+                        Ok(()) => Ok(Created::New(dir.stat(r).map_err(IndexError::from_io)?)),
                         Err(e) if is_exists(&e) => {
-                            let cur = dir.stat(&r).map_err(IndexError::from_io)?;
-                            Ok(Created::Taken(Entry { name: dir.stored_name(&r).unwrap_or(cur.name.clone()), ..cur }))
+                            let cur = dir.stat(r).map_err(IndexError::from_io)?;
+                            Ok(Created::Taken(Entry { name: dir.stored_name(r).unwrap_or(cur.name.clone()), ..cur }))
                         }
                         Err(e) => Err(io_err(e)),
                     }
@@ -382,20 +423,20 @@ impl Index {
                     Created::New(e) => {
                         let tags = match &req.meta.tags {
                             Some(t) => t.clone(),
-                            None => Self::tags_at(&ppath.join(&e.name)),
+                            None => Fs::tags(&ppath.join(e.name.as_os_str())),
                         };
                         let mut out = self.commit_local(
                             &parent_id,
                             &ppath,
-                            items,
-                            vec![Upsert { entry: e, tags, content_rev: None }],
+                            rows,
+                            vec![Upsert { entry: e, tags, content_rev: None, id: None }],
                             &[],
                         )?;
                         out.pop().ok_or(IndexError::NotFound)
                     }
-                    Created::Existing(e) => self.known_or_commit(&parent_id, &ppath, items, e),
+                    Created::Existing(e) => self.known_or_commit(&parent_id, &ppath, rows, e),
                     Created::Taken(e) => {
-                        Err(IndexError::Collision(Box::new(self.known_or_commit(&parent_id, &ppath, items, e)?)))
+                        Err(IndexError::Collision(Box::new(self.known_or_commit(&parent_id, &ppath, rows, e)?)))
                     }
                 }
             })
@@ -414,22 +455,26 @@ impl Index {
         let target = Path::new(target);
         let full = if target.is_absolute() { target.to_owned() } else { dir.join(target) };
         let mut stack: Vec<&std::ffi::OsStr> = Vec::new();
+        let mut prefix: Option<PathBuf> = None;
         for c in full.components() {
             match c {
                 std::path::Component::Normal(n) => stack.push(n),
                 std::path::Component::ParentDir => {
                     stack.pop();
                 }
+                std::path::Component::Prefix(p) => prefix = Some(PathBuf::from(p.as_os_str())),
                 _ => {}
             }
         }
-        let resolved: PathBuf = std::iter::once(std::ffi::OsStr::new("/")).chain(stack).collect();
+        let mut resolved = prefix.unwrap_or_default();
+        resolved.push(std::path::MAIN_SEPARATOR_STR);
+        resolved.extend(stack);
         if resolved.starts_with(root) { Ok(()) } else { Err(IndexError::OutsideShare) }
     }
 
-    /// Replaces a file's content in place, or keeps the upload as a
-    /// conflict copy when the file changed since `base_content_rev`.
-    /// Returns the item and the conflict copy.
+    /// Replaces a file's content, or keeps the upload as a conflict copy
+    /// when the file changed since `base_content_rev`. Returns the item and
+    /// the conflict copy.
     pub async fn write_content(
         self: &Arc<Self>,
         id: &str,
@@ -446,82 +491,68 @@ impl Index {
         let p = path.clone();
         let parent_id = tokio::task::spawn_blocking(move || this.parent_id_of(&p, share)).await??;
         let ppath = path.parent().ok_or(IndexError::NotFound)?.to_owned();
-        let name = file_name(&path)?;
-        let ino: u64 = id.parse().map_err(|_| IndexError::NotAFile)?;
+        let name = raw_of(&path)?;
+        let key = self.key_of(id)?;
         let device = device.to_owned();
         self.locked(&[&parent_id], async || {
-            let items = self.prepare_dir(&parent_id).await?;
-            let old = items.iter().find(|i| i.id == id).cloned();
+            let rows = self.prepare_dir(&parent_id).await?;
+            let old = rows.iter().find(|r| r.item.id == id).map(|r| r.item.clone());
             let pp = ppath.clone();
             let base = old.clone();
+            let display = old.as_ref().map_or_else(|| name.display().0, |o| o.name.clone());
+            let name = name.clone();
             let outcome = tokio::task::spawn_blocking(move || -> Result<Written, IndexError> {
                 let old = base;
+                let nm = name.as_os_str();
                 let dir = Dir::open(&pp, None).map_err(IndexError::from_io)?;
-                let cur = dir.stat(&name).map_err(IndexError::from_io)?;
-                if cur.ino != ino {
+                let cur = dir.stat(nm).map_err(IndexError::from_io)?;
+                if !cur.key.same_file(&key) {
                     return Err(IndexError::NotFound);
                 }
                 if cur.kind != Kind::File {
                     return Err(IndexError::NotAFile);
                 }
                 let sd = Dir::open(&staged.dir, None).map_err(IndexError::from_io)?;
-                let up = sd.open_at(&staged.name, libc::O_RDONLY, 0).map_err(IndexError::from_io)?;
+                let up = sd.open_file(staged.os_name(), false).map_err(IndexError::from_io)?;
                 let changed = |o: &Item| o.size != cur.size || o.mtime_ns != cur.mtime_ns;
                 let conflict = match base_content_rev {
                     None => false,
                     Some(b) => old.as_ref().is_none_or(|o| o.content_rev != b || changed(o)),
                 };
                 if conflict {
-                    let target = dir.open_at(&name, libc::O_RDONLY, 0).map_err(IndexError::from_io)?;
-                    if fsops::same_content(&up, &target).map_err(IndexError::from_io)? {
+                    let target = dir.open_file(nm, false).map_err(IndexError::from_io)?;
+                    if same_content(&up, &target).map_err(IndexError::from_io)? {
                         // A retry of a write that already happened, or the same edit on both sides.
-                        fsops::apply_meta(&target, &set_meta(&meta)).map_err(IndexError::from_io)?;
-                        return Ok(Written::Same(dir.stat(&name).map_err(IndexError::from_io)?));
+                        target.apply_meta(&set_meta(&meta)).map_err(IndexError::from_io)?;
+                        return Ok(Written::Same(dir.stat(nm).map_err(IndexError::from_io)?));
                     }
-                    fsops::apply_meta(&up, &set_meta(&meta)).map_err(IndexError::from_io)?;
-                    fsops::sync(&up, Sync::Full).map_err(IndexError::from_io)?;
-                    let copy = rename_free(&sd, &staged.name, &dir, |n| conflict_name(&name, &device, n))?;
+                    up.apply_meta(&set_meta(&meta)).map_err(IndexError::from_io)?;
+                    up.sync(Durability::Full).map_err(IndexError::from_io)?;
+                    let copy = rename_free(&sd, staged.os_name(), &dir, |n| conflict_name(&display, &device, n))?;
                     return Ok(Written::Conflict {
                         original: cur,
-                        copy: dir.stat(&copy).map_err(IndexError::from_io)?,
+                        copy: dir.stat(copy.as_os_str()).map_err(IndexError::from_io)?,
                     });
                 }
-                // In place, so the file keeps its ID; a clone guards against a crash mid-copy.
-                let target = dir.open_at(&name, libc::O_RDWR, 0).map_err(IndexError::from_io)?;
-                let backup = format!("backup-{ino}-{:x}", rand::random::<u32>());
-                let backed_up = sd.clone_from(&target, &backup).is_ok();
-                fsops::copy_over(&up, &target).map_err(IndexError::from_io)?;
-                fsops::apply_meta(&target, &set_meta(&meta)).map_err(IndexError::from_io)?;
-                fsops::sync(&target, Sync::Full).map_err(IndexError::from_io)?;
-                if backed_up {
-                    let _ = sd.unlink(&backup);
-                }
-                Ok(Written::InPlace(dir.stat(&name).map_err(IndexError::from_io)?))
+                let e = Fs::replace_content(&dir, nm, &up, &sd, &set_meta(&meta)).map_err(IndexError::from_io)?;
+                Ok(Written::InPlace(e))
             })
             .await??;
-            let tags_of = |e: &Entry| Self::tags_at(&ppath.join(&e.name));
+            let tags_of = |e: &Entry| Fs::tags(&ppath.join(e.name.as_os_str()));
+            let id = Some(id.to_owned());
             match outcome {
                 Written::InPlace(e) => {
                     let tags = tags_of(&e);
-                    let mut out = self.commit_local(
-                        &parent_id,
-                        &ppath,
-                        items,
-                        vec![Upsert { entry: e, tags, content_rev: None }],
-                        &[],
-                    )?;
+                    let up = Upsert { entry: e, tags, content_rev: None, id };
+                    let mut out = self.commit_local(&parent_id, &ppath, rows, vec![up], &[])?;
                     Ok((out.pop().ok_or(IndexError::NotFound)?, None))
                 }
                 Written::Same(e) => {
-                    let keep = old.as_ref().filter(|o| o.size == e.size && o.mtime_ns == e.mtime_ns).map(|o| o.content_rev);
+                    let keep =
+                        old.as_ref().filter(|o| o.size == e.size && o.mtime_ns == e.mtime_ns).map(|o| o.content_rev);
                     let tags = tags_of(&e);
-                    let mut out = self.commit_local(
-                        &parent_id,
-                        &ppath,
-                        items,
-                        vec![Upsert { entry: e, tags, content_rev: keep }],
-                        &[],
-                    )?;
+                    let up = Upsert { entry: e, tags, content_rev: keep, id };
+                    let mut out = self.commit_local(&parent_id, &ppath, rows, vec![up], &[])?;
                     Ok((out.pop().ok_or(IndexError::NotFound)?, None))
                 }
                 Written::Conflict { original, copy } => {
@@ -529,17 +560,17 @@ impl Index {
                     let current = old.clone().filter(|o| o.size == original.size && o.mtime_ns == original.mtime_ns);
                     if current.is_none() {
                         let tags = tags_of(&original);
-                        ups.push(Upsert { entry: original, tags, content_rev: None });
+                        ups.push(Upsert { entry: original, tags, content_rev: None, id });
                     }
                     let tags = tags_of(&copy);
-                    ups.push(Upsert { entry: copy, tags, content_rev: None });
-                    let mut out = self.commit_local(&parent_id, &ppath, items, ups, &[])?;
+                    ups.push(Upsert { entry: copy, tags, content_rev: None, id: None });
+                    let mut out = self.commit_local(&parent_id, &ppath, rows, ups, &[])?;
                     let copy = out.pop().ok_or(IndexError::NotFound)?;
                     let item = match current {
                         Some(c) => c,
                         None => out.pop().ok_or(IndexError::NotFound)?,
                     };
-                    tracing::info!(id, copy = %copy.name, "write conflict: upload kept as a copy");
+                    tracing::info!(id = ?item.id, copy = %copy.name, "write conflict: upload kept as a copy");
                     Ok((item, Some(copy)))
                 }
             }
@@ -557,7 +588,11 @@ impl Index {
     ) -> Result<Item, IndexError> {
         let id = self.canonical(id);
         if id == proto::ROOT_ID || id.starts_with(proto::SHARE_ID_PREFIX) {
-            return if new_parent_id.is_none() && new_name.is_none() { self.stat(&id).await } else { Err(IndexError::Denied) };
+            return if new_parent_id.is_none() && new_name.is_none() {
+                self.stat(&id).await
+            } else {
+                Err(IndexError::Denied)
+            };
         }
         let (path, share) = match self.resolve(&id)? {
             Target::Path { path, share } => (path, share),
@@ -567,77 +602,82 @@ impl Index {
         let p = path.clone();
         let from_id = tokio::task::spawn_blocking(move || this.parent_id_of(&p, share)).await??;
         let from_path = path.parent().ok_or(IndexError::NotFound)?.to_owned();
-        let cur_name = file_name(&path)?;
-        let (to_id, to_path) = match new_parent_id.map(|p| self.canonical(p)) {
-            Some(p) if p != from_id => {
-                let (p, path, _) = self.writable_dir(&p)?;
-                (p, path)
-            }
-            _ => (from_id.clone(), from_path.clone()),
+        let cur_raw = raw_of(&path)?;
+        let (to_id, to_path, to_share) = match new_parent_id.map(|p| self.canonical(p)) {
+            Some(p) if p != from_id => self.writable_dir(&p)?,
+            _ => (from_id.clone(), from_path.clone(), share),
         };
-        let name = new_name.unwrap_or(&cur_name).to_owned();
-        if !proto::valid_name(&name) {
-            return Err(IndexError::BadName);
-        }
-        let ino: u64 = id.parse().map_err(|_| IndexError::BadId(id.clone()))?;
-        let moving = to_id != from_id || name != cur_name;
+        let new_raw = match new_name {
+            Some(n) => Some(RawName::from_display(n)?),
+            None => None,
+        };
+        let key = self.key_of(&id)?;
         let same_dir = to_id == from_id;
-        if moving && to_path.starts_with(&path) {
-            return Err(IndexError::BadRequest("cannot move a folder into itself".into()));
-        }
         self.locked(&[&from_id, &to_id], async || {
-            let from_items = self.prepare_dir(&from_id).await?;
-            let to_items = if same_dir { Vec::new() } else { self.prepare_dir(&to_id).await? };
-            let old = from_items.iter().find(|i| i.id == id).cloned();
-            let (fp, tp, nm, cn) = (from_path.clone(), to_path.clone(), name.clone(), cur_name.clone());
+            let from_rows = self.prepare_dir(&from_id).await?;
+            let to_rows = if same_dir { Vec::new() } else { self.prepare_dir(&to_id).await? };
+            let old = from_rows.iter().find(|r| r.item.id == id).cloned();
+            // The current display name (maybe an alias) means "keep the raw name".
+            let raw = match (&new_raw, &old) {
+                (Some(_), Some(o)) if new_name == Some(o.item.name.as_str()) => cur_raw.clone(),
+                (Some(r), _) => r.clone(),
+                (None, _) => cur_raw.clone(),
+            };
+            let moving = !same_dir || raw != cur_raw;
+            if moving && to_path.starts_with(&path) {
+                return Err(IndexError::BadRequest("cannot move a folder into itself".into()));
+            }
+            if moving
+                && self.shares[to_share].needs_aliases()
+                && let Some(name) = new_name.or(old.as_ref().map(|o| o.item.name.as_str()))
+                && let Some(taken) = fold_collision(if same_dir { &from_rows } else { &to_rows }, name, Some(&id))
+            {
+                return Err(IndexError::Collision(Box::new(taken.item.clone())));
+            }
+            let (fp, tp, nm, cn) = (from_path.clone(), to_path.clone(), raw.clone(), cur_raw.clone());
             let res = tokio::task::spawn_blocking(move || -> Result<Result<Entry, Entry>, IndexError> {
+                let (nm, cn) = (nm.as_os_str(), cn.as_os_str());
                 let from = Dir::open(&fp, None).map_err(IndexError::from_io)?;
                 let to = if same_dir { None } else { Some(Dir::open(&tp, None).map_err(IndexError::from_io)?) };
                 let to_ref = to.as_ref().unwrap_or(&from);
-                let cur = from.stat(&cn).map_err(IndexError::from_io)?;
-                if cur.ino != ino {
+                let cur = from.stat(cn).map_err(IndexError::from_io)?;
+                if !cur.key.same_file(&key) {
                     return Err(IndexError::NotFound);
                 }
-                if moving && let Err(e) = from.rename_excl(&cn, to_ref, &nm) {
+                if moving && let Err(e) = from.rename_noreplace(cn, to_ref, nm) {
                     if is_exists(&e) {
-                        let taken = to_ref.stat(&nm).map_err(IndexError::from_io)?;
-                        let stored = to_ref.stored_name(&nm).unwrap_or(taken.name.clone());
+                        let taken = to_ref.stat(nm).map_err(IndexError::from_io)?;
+                        let stored = to_ref.stored_name(nm).unwrap_or(taken.name.clone());
                         return Ok(Err(Entry { name: stored, ..taken }));
                     }
                     return Err(io_err(e));
                 }
                 if !meta.is_empty() {
-                    let flags = match cur.kind {
-                        Kind::Dir => libc::O_RDONLY | libc::O_DIRECTORY,
-                        Kind::Symlink => libc::O_RDONLY | libc::O_SYMLINK,
-                        _ => libc::O_RDONLY,
-                    };
-                    let fd = to_ref.open_at(&nm, flags & !libc::O_NOFOLLOW, 0);
-                    match fd {
-                        Ok(fd) => fsops::apply_meta(&fd, &set_meta(&meta)).map_err(IndexError::from_io)?,
+                    match to_ref.open_meta(nm, cur.kind) {
+                        Ok(fd) => fd.apply_meta(&set_meta(&meta)).map_err(IndexError::from_io)?,
                         Err(e) => tracing::debug!(error = %e, "cannot open item for metadata"),
                     }
                 }
-                Ok(Ok(to_ref.stat(&nm).map_err(IndexError::from_io)?))
+                Ok(Ok(to_ref.stat(nm).map_err(IndexError::from_io)?))
             })
             .await??;
             let e = match res {
                 Ok(e) => e,
                 Err(taken) => {
-                    let items = if same_dir { from_items } else { to_items };
-                    return Err(IndexError::Collision(Box::new(self.known_or_commit(&to_id, &to_path, items, taken)?)));
+                    let rows = if same_dir { from_rows } else { to_rows };
+                    return Err(IndexError::Collision(Box::new(self.known_or_commit(&to_id, &to_path, rows, taken)?)));
                 }
             };
-            let tags = Self::tags_at(&to_path.join(&e.name));
-            let content_rev = old.as_ref().map(|o| o.content_rev);
-            let up = Upsert { entry: e, tags, content_rev };
+            let tags = Fs::tags(&to_path.join(e.name.as_os_str()));
+            let content_rev = old.as_ref().map(|o| o.item.content_rev);
+            let up = Upsert { entry: e, tags, content_rev, id: Some(id.clone()) };
             let item = if same_dir {
-                self.commit_local(&to_id, &to_path, from_items, vec![up], &[])?
+                self.commit_local(&to_id, &to_path, from_rows, vec![up], &[])?
             } else {
                 // Into the new folder first: a client reading the change feed
                 // in between must never see the item as deleted.
-                let out = self.commit_local(&to_id, &to_path, to_items, vec![up], &[])?;
-                self.commit_local(&from_id, &from_path, from_items, Vec::new(), std::slice::from_ref(&id))?;
+                let out = self.commit_local(&to_id, &to_path, to_rows, vec![up], &[])?;
+                self.commit_local(&from_id, &from_path, from_rows, Vec::new(), std::slice::from_ref(&id))?;
                 out
             };
             item.into_iter().next().ok_or(IndexError::NotFound)
@@ -655,19 +695,20 @@ impl Index {
         Ok(seq)
     }
 
-    /// Moves an item to basebook's Trash. With `listed`, it shows in the
+    /// Moves an item to the server's Trash. With `listed`, it shows in the
     /// trash container so the client can put it back.
     pub async fn trash(self: &Arc<Self>, id: &str, listed: bool, recursive: bool) -> Result<Item, IndexError> {
         let id = self.canonical(id);
         if id == proto::ROOT_ID || id.starts_with(proto::SHARE_ID_PREFIX) || id == proto::TRASH_ID {
             return Err(IndexError::Denied);
         }
+        self.trash_impl()?;
         let (path, share) = match self.resolve_any(&id)? {
             Target::Path { path, share } => (path, share),
             Target::Trashed { .. } => {
                 let item = self.trashed_item(&id)?.ok_or(IndexError::NotFound)?;
                 if !listed {
-                    // Deleted from the client's trash: it stays in basebook's.
+                    // Deleted from the client's trash: it stays in the server's.
                     self.forget(&id).await?;
                 }
                 return Ok(item);
@@ -678,41 +719,41 @@ impl Index {
         let p = path.clone();
         let parent_id = tokio::task::spawn_blocking(move || this.parent_id_of(&p, share)).await??;
         let ppath = path.parent().ok_or(IndexError::NotFound)?.to_owned();
-        let name = file_name(&path)?;
-        let ino: u64 = id.parse().map_err(|_| IndexError::BadId(id.clone()))?;
-        let trash = self.writes.trash.clone();
+        let name = raw_of(&path)?;
+        let key = self.key_of(&id)?;
         self.locked(&[&parent_id], async || {
-            let items = self.prepare_dir(&parent_id).await?;
-            let old = items.iter().find(|i| i.id == id).cloned();
-            let (pp, nm, tr, full) = (ppath.clone(), name.clone(), trash.clone(), path.clone());
-            let e = tokio::task::spawn_blocking(move || -> Result<Entry, IndexError> {
+            let rows = self.prepare_dir(&parent_id).await?;
+            let old = rows.iter().find(|r| r.item.id == id).map(|r| r.item.clone());
+            let shown = old.as_ref().map_or_else(|| name.display().0, |o| o.name.clone());
+            let this = self.clone();
+            let (pp, nm, full) = (ppath.clone(), name.clone(), path.clone());
+            let (to, e) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, Entry), IndexError> {
+                let trash = this.trash_impl()?;
+                let nm = nm.as_os_str();
                 let dir = Dir::open(&pp, None).map_err(IndexError::from_io)?;
-                let cur = dir.stat(&nm).map_err(IndexError::from_io)?;
-                if cur.ino != ino {
+                let cur = dir.stat(nm).map_err(IndexError::from_io)?;
+                if !cur.key.same_file(&key) {
                     return Err(IndexError::NotFound);
                 }
                 if cur.kind == Kind::Dir
                     && !recursive
-                    && fsops::scan_dir(&full).map_err(IndexError::from_io)?.iter().any(|e| e.name != ".DS_Store")
+                    && Dir::open(&full, None)
+                        .and_then(|d| d.scan())
+                        .map_err(IndexError::from_io)?
+                        .iter()
+                        .any(|e| !Fs::skip(e.name.as_os_str()))
                 {
                     return Err(IndexError::NotEmpty);
                 }
-                for n in 1..1000 {
-                    let tname = trash_name(&nm, n);
-                    let to = tr.join(&tname);
-                    match dir.rename_to_path_excl(&nm, &to) {
-                        Ok(()) => return fsops::lstat(&to).map_err(IndexError::from_io),
-                        Err(e) if is_exists(&e) => continue,
-                        Err(e) => return Err(io_err(e)),
-                    }
-                }
-                Err(IndexError::Io(io::Error::other("no free name in the Trash")))
+                let to = trash.trash(&dir, nm).map_err(io_err)?;
+                let e = Fs::lstat(&to).map_err(IndexError::from_io)?;
+                Ok((to, e))
             })
             .await??;
-            tracing::info!(id, name = %name, as_name = %e.name, listed, "moved to Trash");
-            let tags = Self::tags_at(&trash.join(&e.name));
-            let mut item = item_of(id.clone(), proto::TRASH_ID, e, tags);
-            item.name = name.clone();
+            tracing::info!(id, name = %shown, to = %to.display(), listed, "moved to Trash");
+            let tags = Fs::tags(&to);
+            let mut item = row_of(id.clone(), proto::TRASH_ID, e, tags).item;
+            item.name = shown.clone();
             item.content_rev = old.as_ref().map_or(0, |o| o.content_rev);
             if listed {
                 // The trash row first: the removal below is then a move, not a deletion.
@@ -721,12 +762,17 @@ impl Index {
                     if item.content_rev == 0 {
                         item.content_rev = seq;
                     }
-                    let t = Trashed { orig_parent: parent_id.clone(), orig_name: name.clone(), item: item.clone() };
+                    let t = Trashed {
+                        orig_parent: parent_id.clone(),
+                        orig_name: shown.clone(),
+                        item: item.clone(),
+                        path: Some(to.clone()),
+                    };
                     self.trashed.lock().map_err(|_| IndexError::Poisoned)?.insert(id.clone(), t.clone());
                     Ok(self.db.send(Op::TrashSet { id: id.clone(), trashed: t, seq })?)
                 })?;
             }
-            self.commit_local(&parent_id, &ppath, items, Vec::new(), std::slice::from_ref(&id))?;
+            self.commit_local(&parent_id, &ppath, rows, Vec::new(), std::slice::from_ref(&id))?;
             Ok(item)
         })
         .await
@@ -734,32 +780,38 @@ impl Index {
 
     /// Puts an item from the trash container back as `parent_id/name`.
     pub async fn untrash(self: &Arc<Self>, id: &str, parent_id: &str, name: &str) -> Result<Item, IndexError> {
-        if !proto::valid_name(name) {
-            return Err(IndexError::BadName);
-        }
+        let raw = RawName::from_display(name)?;
         let rec = self.trashed.lock().map_err(|_| IndexError::Poisoned)?.get(id).cloned();
         let rec = rec.ok_or(IndexError::NotFound)?;
         let Target::Trashed { path } = self.resolve_any(id)? else {
-            // Already back in a share (put back on basebook): just move it.
+            // Already back in a share (put back on the server): just move it.
             self.forget(id).await?;
             return self.modify(id, Some(parent_id), Some(name), Meta::default()).await;
         };
-        let (parent_id, ppath, _) = self.writable_dir(parent_id)?;
-        let ino: u64 = id.parse().map_err(|_| IndexError::BadId(id.to_owned()))?;
+        let (parent_id, ppath, share) = self.writable_dir(parent_id)?;
+        let key = self.key_of(id)?;
         let item = self
             .locked(&[&parent_id], async || {
-                let items = self.prepare_dir(&parent_id).await?;
-                let (src, pp, nm) = (path.clone(), ppath.clone(), name.to_owned());
+                let rows = self.prepare_dir(&parent_id).await?;
+                if self.shares[share].needs_aliases()
+                    && let Some(taken) = fold_collision(&rows, name, Some(id))
+                {
+                    return Err(IndexError::Collision(Box::new(taken.item.clone())));
+                }
+                let this = self.clone();
+                let (src, pp, nm) = (path.clone(), ppath.clone(), raw.clone());
                 let res = tokio::task::spawn_blocking(move || -> Result<Result<Entry, Entry>, IndexError> {
-                    if fsops::lstat(&src).map_err(IndexError::from_io)?.ino != ino {
+                    let trash = this.trash_impl()?;
+                    let nm = nm.as_os_str();
+                    if !Fs::lstat(&src).map_err(IndexError::from_io)?.key.same_file(&key) {
                         return Err(IndexError::NotFound);
                     }
                     let to = Dir::open(&pp, None).map_err(IndexError::from_io)?;
-                    match to.rename_from_path_excl(&src, &nm) {
-                        Ok(()) => Ok(Ok(to.stat(&nm).map_err(IndexError::from_io)?)),
+                    match trash.put_back(&src, &to, nm) {
+                        Ok(()) => Ok(Ok(to.stat(nm).map_err(IndexError::from_io)?)),
                         Err(e) if is_exists(&e) => {
-                            let taken = to.stat(&nm).map_err(IndexError::from_io)?;
-                            Ok(Err(Entry { name: to.stored_name(&nm).unwrap_or(taken.name.clone()), ..taken }))
+                            let taken = to.stat(nm).map_err(IndexError::from_io)?;
+                            Ok(Err(Entry { name: to.stored_name(nm).unwrap_or(taken.name.clone()), ..taken }))
                         }
                         Err(e) => Err(io_err(e)),
                     }
@@ -768,12 +820,14 @@ impl Index {
                 let e = match res {
                     Ok(e) => e,
                     Err(taken) => {
-                        return Err(IndexError::Collision(Box::new(self.known_or_commit(&parent_id, &ppath, items, taken)?)));
+                        return Err(IndexError::Collision(Box::new(
+                            self.known_or_commit(&parent_id, &ppath, rows, taken)?,
+                        )));
                     }
                 };
-                let tags = Self::tags_at(&ppath.join(&e.name));
-                let up = Upsert { entry: e, tags, content_rev: Some(rec.item.content_rev) };
-                let mut out = self.commit_local(&parent_id, &ppath, items, vec![up], &[])?;
+                let tags = Fs::tags(&ppath.join(e.name.as_os_str()));
+                let up = Upsert { entry: e, tags, content_rev: Some(rec.item.content_rev), id: Some(id.to_owned()) };
+                let mut out = self.commit_local(&parent_id, &ppath, rows, vec![up], &[])?;
                 out.pop().ok_or(IndexError::NotFound)
             })
             .await?;
@@ -783,7 +837,7 @@ impl Index {
         Ok(item)
     }
 
-    /// Drops an item from the trash container (it stays in basebook's Trash).
+    /// Drops an item from the trash container (it stays in the server's Trash).
     pub async fn forget(self: &Arc<Self>, id: &str) -> Result<(), IndexError> {
         if self.trashed.lock().map_err(|_| IndexError::Poisoned)?.remove(id).is_some() {
             self.with_seq(|seq| Ok(self.db.send(Op::TrashForget { id: id.to_owned(), tombstone: true, seq })?))?;
@@ -795,37 +849,50 @@ impl Index {
     pub(super) fn trashed_item(&self, id: &str) -> Result<Option<Item>, IndexError> {
         let rec = self.trashed.lock().map_err(|_| IndexError::Poisoned)?.get(id).cloned();
         let Some(rec) = rec else { return Ok(None) };
-        let ino: u64 = id.parse().map_err(|_| IndexError::BadId(id.to_owned()))?;
-        let Ok(path) = self.volume.path_of(ino) else { return Ok(None) };
-        if !path.starts_with(&self.writes.trash) {
+        let Some(trash) = self.writes.trash.as_ref() else { return Ok(None) };
+        let Ok(key) = self.key_of(id) else { return Ok(None) };
+        let path = match self.platform_path(&key) {
+            Ok(Some(p)) => p,
+            Ok(None) => match rec.path.clone() {
+                Some(p) => p,
+                None => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        if !trash.contains(&path) {
             return Ok(None);
         }
-        let Ok(e) = fsops::lstat(&path) else { return Ok(None) };
-        let mut item = item_of(id.to_owned(), proto::TRASH_ID, e, rec.item.tags.clone());
+        let Ok(e) = Fs::lstat(&path) else { return Ok(None) };
+        if !e.key.same_file(&key) {
+            return Ok(None);
+        }
+        let mut item = row_of(id.to_owned(), proto::TRASH_ID, e, rec.item.tags.clone()).item;
         item.name = rec.item.name.clone();
         item.rev = rec.item.rev;
         item.content_rev = rec.item.content_rev;
         Ok(Some(item))
     }
 
-    /// The trash container's listing. Items no longer in basebook's Trash
+    /// The trash container's listing. Items no longer in the server's Trash
     /// (emptied, or put back there) leave it.
     pub(super) fn trash_listing(&self) -> Result<Listing, IndexError> {
         let ids: Vec<ItemId> = self.trashed.lock().map_err(|_| IndexError::Poisoned)?.keys().cloned().collect();
-        let mut items = Vec::new();
+        let mut rows = Vec::new();
         for id in ids {
             match self.trashed_item(&id)? {
-                Some(i) => items.push(i),
+                Some(item) => rows.push(Row { item, key: FileKey::default(), raw: RawName::default() }),
                 None => {
                     if self.trashed.lock().map_err(|_| IndexError::Poisoned)?.remove(&id).is_some() {
-                        self.with_seq(|seq| Ok(self.db.send(Op::TrashForget { id: id.clone(), tombstone: true, seq })?))?;
+                        self.with_seq(|seq| {
+                            Ok(self.db.send(Op::TrashForget { id: id.clone(), tombstone: true, seq })?)
+                        })?;
                     }
                 }
             }
         }
-        items.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        rows.sort_unstable_by(|a, b| a.item.name.cmp(&b.item.name));
         // Not cached: a new revision every time, so clients always take it.
         let rev = self.state()?.seq;
-        encode_listing(proto::TRASH_ID, rev, items)
+        Ok(encode_listing(proto::TRASH_ID, rev, rows))
     }
 }

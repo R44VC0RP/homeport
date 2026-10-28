@@ -107,6 +107,7 @@ pub struct HelloInfo {
     pub index_id: u64,
     pub seq: u64,
     pub roots: Vec<Item>,
+    pub server: proto::ServerInfo,
 }
 
 #[derive(Clone, Debug)]
@@ -789,8 +790,8 @@ impl Inner {
         send.finish().ok();
         let mut resp = Responses { recv, deadline: Some(wait), inner: self.clone() };
         match resp.next().await? {
-            Response::Hello { index_id, seq, roots, .. } => {
-                let prev = lock(&self.hello).replace(HelloInfo { index_id, seq, roots });
+            Response::Hello { index_id, seq, roots, server, .. } => {
+                let prev = lock(&self.hello).replace(HelloInfo { index_id, seq, roots, server });
                 if prev.is_some_and(|p| p.index_id != index_id) {
                     tracing::warn!(index_id, "server index changed; cached state must be re-enumerated");
                 }

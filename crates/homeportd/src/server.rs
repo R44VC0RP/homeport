@@ -79,14 +79,16 @@ pub fn endpoint(identity: &Identity, bind: SocketAddr) -> Result<quinn::Endpoint
 
 struct Conn {
     index: Arc<Index>,
+    info: Arc<proto::ServerInfo>,
     client_id: OnceLock<String>,
     peer: SocketAddr,
 }
 
-pub async fn serve(endpoint: quinn::Endpoint, index: Arc<Index>, auth: Arc<Authorizer>) {
+pub async fn serve(endpoint: quinn::Endpoint, index: Arc<Index>, auth: Arc<Authorizer>, info: Arc<proto::ServerInfo>) {
     while let Some(incoming) = endpoint.accept().await {
         let index = index.clone();
         let auth = auth.clone();
+        let info = info.clone();
         tokio::spawn(async move {
             let peer = incoming.remote_address();
             if !auth.allow(peer.ip()).await {
@@ -102,7 +104,7 @@ pub async fn serve(endpoint: quinn::Endpoint, index: Arc<Index>, auth: Arc<Autho
                 }
             };
             match conn {
-                Ok(conn) => handle_conn(conn, Arc::new(Conn { index, client_id: OnceLock::new(), peer })).await,
+                Ok(conn) => handle_conn(conn, Arc::new(Conn { index, info, client_id: OnceLock::new(), peer })).await,
                 Err(e) => tracing::debug!(%peer, error = %e, "handshake failed"),
             }
         });
@@ -209,11 +211,8 @@ fn request_kind(b: &RequestBody) -> &'static str {
 async fn receive(recv: &mut RecvStream, dir: &std::path::Path, size: u64) -> Result<Staged, StreamError> {
     use std::io::Write;
     let staged = Staged::new(dir);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(staged.path())
-        .map_err(IndexError::from_io)?;
+    let mut file =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(staged.path()).map_err(IndexError::from_io)?;
     let mut got: u64 = 0;
     loop {
         let chunk = tokio::time::timeout(UPLOAD_IDLE, recv.read_chunk(1 << 20, true))
@@ -268,7 +267,7 @@ async fn dispatch(
                 return write(send, &Response::Item(item)).await;
             }
             let staged = match kind {
-                proto::Kind::File => Some(receive(recv, index.staging_dir(), size).await?),
+                proto::Kind::File => Some(receive(recv, &index.staging_for(&parent_id), size).await?),
                 _ => None,
             };
             let req = CreateReq { op_id, parent_id, name, kind, link_target, meta, may_exist };
@@ -276,7 +275,7 @@ async fn dispatch(
             write(send, &Response::Item(item)).await
         }
         RequestBody::WriteContent { id, base_content_rev, size, meta, device } => {
-            let staged = receive(recv, index.staging_dir(), size).await?;
+            let staged = receive(recv, &index.staging_for(&id), size).await?;
             let (item, conflict) = index.write_content(&id, base_content_rev, staged, meta, &device).await?;
             write(send, &Response::Written { item, conflict }).await
         }
@@ -311,6 +310,7 @@ async fn dispatch(
                     index_id: index.index_id,
                     seq: index.committed_seq(),
                     roots: index.roots(),
+                    server: (*ctx.info).clone(),
                 },
             )
             .await
@@ -355,7 +355,8 @@ async fn dispatch(
             let png = crate::thumbs::get(index, &id, max_pixels).await?.unwrap_or_default();
             for (i, chunk) in png.chunks(proto::READ_CHUNK).enumerate() {
                 let offset = (i * proto::READ_CHUNK) as u64;
-                let data = Response::Data { offset, compressed: false, raw_len: chunk.len() as u32, bytes: chunk.to_vec() };
+                let data =
+                    Response::Data { offset, compressed: false, raw_len: chunk.len() as u32, bytes: chunk.to_vec() };
                 write(send, &data).await?;
             }
             let total = png.len() as u64;
@@ -383,22 +384,23 @@ async fn read(
     let mut compress = compress && !proto::is_precompressed(&name);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, StreamError>>(8);
     let producer = tokio::task::spawn_blocking(move || {
-        use std::os::fd::AsRawFd;
+        use crate::platform::FileOps;
         let mut buf = vec![0u8; proto::READ_CHUNK];
         let mut pos = offset;
         let mut incompressible = 0;
         while pos < end {
             let want = (end - pos).min(proto::READ_CHUNK as u64) as usize;
-            // SAFETY: `buf` has room for `want` bytes; `fd` is open for reading.
-            let n = unsafe { libc::pread(fd.as_raw_fd(), buf.as_mut_ptr().cast(), want, pos as libc::off_t) };
-            if n < 0 {
-                let _ = tx.blocking_send(Err(IndexError::Io(std::io::Error::last_os_error()).into()));
-                return pos - offset;
-            }
+            let n = match fd.read_at(&mut buf[..want], pos) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(IndexError::from_io(e).into()));
+                    return pos - offset;
+                }
+            };
             if n == 0 {
                 break;
             }
-            let chunk = &buf[..n as usize];
+            let chunk = &buf[..n];
             let mut frame = None;
             if compress {
                 match zstd::bulk::compress(chunk, 1) {

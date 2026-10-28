@@ -2,11 +2,12 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
+
+use crate::platform::{Sys, SysOps};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -36,17 +37,9 @@ pub fn load_or_create(dir: &Path) -> Result<Identity, TlsError> {
     let key_path = dir.join("key.der");
     let fp_path = dir.join("cert.sha256");
     if !(cert_path.exists() && key_path.exists()) {
-        fs::create_dir_all(dir).map_err(io_err(dir))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
+        Sys::create_private_dir(dir).map_err(io_err(dir))?;
         let ck = rcgen::generate_simple_self_signed(vec![homeport_proto::SERVER_NAME.to_owned()])?;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&key_path)
-            .map_err(io_err(&key_path))?;
-        io::Write::write_all(&mut f, &ck.signing_key.serialize_der()).map_err(io_err(&key_path))?;
+        Sys::write_private(&key_path, &ck.signing_key.serialize_der()).map_err(io_err(&key_path))?;
         fs::write(&cert_path, ck.cert.der()).map_err(io_err(&cert_path))?;
         tracing::info!(path = %cert_path.display(), "generated server certificate");
     }

@@ -9,7 +9,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Bumped on any incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// TLS ALPN identifier.
 pub const ALPN: &[u8] = b"homeport/1";
 /// Default UDP port of `homeportd`.
@@ -33,8 +33,76 @@ pub const TRASH_ID: &str = "trash";
 /// Largest request header (the frame before an upload's content).
 pub const MAX_REQUEST: usize = 1024 * 1024;
 
-/// Item identifier: the APFS file ID in decimal, or `root` / `root:<share>`.
+/// Item identifier: a server-assigned number in decimal, or `root` /
+/// `root:<share>` / `trash`. Numbers are stable for the life of the server's
+/// index (`index_id`); a macOS server uses the APFS file ID for items on its
+/// first volume.
 pub type ItemId = String;
+
+/// Bits of [`Item::flags`]. Where macOS has a BSD flag with the same meaning
+/// the value is the same (`UF_HIDDEN`, `UF_IMMUTABLE`, `SF_DATALESS`), so
+/// clients built against protocol 2 keep reading the hidden bit.
+pub mod item_flags {
+    /// Locked / read-only (macOS `UF_IMMUTABLE`, Windows `FILE_ATTRIBUTE_READONLY`).
+    pub const READ_ONLY: u32 = 0x0000_0002;
+    /// Hidden (macOS `UF_HIDDEN`, Windows `FILE_ATTRIBUTE_HIDDEN`).
+    pub const HIDDEN: u32 = 0x0000_8000;
+    /// `name` is an alias: the raw name collides (case or Unicode
+    /// normalization) with a sibling's, e.g. `README (2).md`.
+    pub const NAME_ALIASED: u32 = 0x0100_0000;
+    /// The raw name is not valid Unicode; `name` escapes the invalid parts.
+    pub const NAME_UNREPRESENTABLE: u32 = 0x0200_0000;
+    /// Content is not on the server's disk (a cloud placeholder: macOS
+    /// `SF_DATALESS`, Windows OneDrive files on demand).
+    pub const CLOUD_ONLY: u32 = 0x4000_0000;
+    /// Every defined bit.
+    pub const ALL: u32 = READ_ONLY | HIDDEN | NAME_ALIASED | NAME_UNREPRESENTABLE | CLOUD_ONLY;
+}
+
+/// Bits of [`ServerInfo::caps`].
+pub mod caps {
+    /// `Thumbnail` makes pictures (otherwise it always answers none).
+    pub const THUMBNAILS: u32 = 1 << 0;
+    /// `Trash` / `Untrash` work.
+    pub const TRASH: u32 = 1 << 1;
+    /// Extended attributes in `Meta::xattrs` are kept.
+    pub const XATTRS: u32 = 1 << 2;
+    /// Finder tags in `Meta::tags` are kept.
+    pub const TAGS: u32 = 1 << 3;
+    /// Symlinks can be created.
+    pub const SYMLINKS: u32 = 1 << 4;
+    /// `Meta::crtime_ns` is applied.
+    pub const SET_CRTIME: u32 = 1 << 5;
+    /// `Meta::hidden` is applied.
+    pub const HIDDEN: u32 = 1 << 6;
+    /// `Meta::mode` is applied (POSIX permission bits).
+    pub const MODE: u32 = 1 << 7;
+}
+
+/// The server's operating system.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Os {
+    MacOs,
+    Linux,
+    Windows,
+    Other,
+}
+
+/// Facts about the server, sent in `Hello`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ServerInfo {
+    /// Display name (the host name unless configured).
+    pub name: String,
+    pub os: Os,
+    /// `homeportd` version.
+    pub version: String,
+    /// Some share tells names apart by case (`a` and `A` can both exist).
+    pub case_sensitive: bool,
+    /// Some share tells names apart by Unicode normalization (NFC vs NFD).
+    pub normalization_sensitive: bool,
+    /// [`caps`] bits.
+    pub caps: u32,
+}
 
 /// Request class. Lower is more urgent; it maps to the QUIC stream priority.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -86,9 +154,10 @@ pub struct Item {
     pub rev: u64,
     /// Server `seq` at which its content (size or mtime) last changed.
     pub content_rev: u64,
-    /// Creation time; 0 when unknown (rows indexed before protocol 2).
+    /// Creation time; 0 when unknown (not reported by the filesystem, or
+    /// rows indexed before protocol 2).
     pub crtime_ns: i64,
-    /// BSD flags (`UF_HIDDEN`, ...).
+    /// [`item_flags`] bits.
     pub flags: u32,
     /// Raw `com.apple.metadata:_kMDItemUserTags` value (Finder tags), when known.
     #[serde(with = "serde_bytes")]
@@ -253,6 +322,10 @@ pub enum ErrorCode {
     Denied,
     /// The upload ended before all its bytes arrived.
     Incomplete,
+    /// The file is in use on the server (Windows sharing violation); retry later.
+    Busy,
+    /// The content is a cloud placeholder the server will not download.
+    CloudOnly,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -262,6 +335,7 @@ pub enum Response {
         index_id: u64,
         seq: u64,
         roots: Vec<Item>,
+        server: ServerInfo,
     },
     NotModified {
         dir_id: ItemId,
@@ -322,7 +396,7 @@ pub enum Response {
     LinkTarget {
         target: String,
     },
-    /// The name is taken (case-insensitively) by `existing`.
+    /// The name is taken (case-insensitively, or by Unicode normalization) by `existing`.
     Collision {
         existing: Item,
     },
