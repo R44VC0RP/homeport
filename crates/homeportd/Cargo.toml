@@ -37,6 +37,8 @@ quinn-udp.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 # statx, getdents64, openat2, renameat2, inotify, xattrs, FICLONE.
 rustix = { version = "1.1", features = ["fs", "event", "time"] }
+# Server-side thumbnails of raster images (no Quick Look on Linux).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
 
 [lints]
 workspace = true

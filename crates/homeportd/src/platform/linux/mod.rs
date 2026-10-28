@@ -6,6 +6,7 @@
 
 mod fs;
 mod tags;
+mod thumbs;
 mod trash;
 mod watch;
 
@@ -14,10 +15,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use fs::{Dir, File, Fs, Volume};
+pub use thumbs::Thumbnailer;
 pub use trash::Trash;
 pub use watch::Watcher;
 
-use super::{ServiceOps, SysOps, ThumbnailerOps, unix, unsupported};
+use super::{ServiceOps, SysOps, unix, unsupported};
 
 /// Process plumbing.
 pub struct Sys;
@@ -77,27 +79,6 @@ impl SysOps for Sys {
 
     fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         unix::write_private(path, bytes)
-    }
-}
-
-/// Thumbnails.
-pub struct Thumbnailer;
-
-impl ThumbnailerOps for Thumbnailer {
-    /// Set to true once `generate` works.
-    const AVAILABLE: bool = false;
-
-    fn wants(_name: &str) -> bool {
-        false
-    }
-
-    /// First the freedesktop cache (`~/.cache/thumbnails/{large,x-large}/
-    /// md5(file URI).png`, valid when `Thumb::MTime` matches). Then: `image` +
-    /// `fast_image_resize` for raster formats, `ffmpeg -ss 1 -frames:v 1` for
-    /// video, `pdftoppm` for PDF, or the system thumbnailers in
-    /// `/usr/share/thumbnailers/*.thumbnailer` (`Exec=` with `%i %o %s`).
-    async fn generate(_path: &Path, _px: u32, _scratch: &Path) -> Option<Vec<u8>> {
-        None
     }
 }
 
