@@ -1,7 +1,8 @@
 //! Link-quality estimator with hysteresis.
 //!
 //! Downgrades are immediate (Offline only after several missed probes);
-//! upgrades need consistently better probes over a window.
+//! upgrades need consistently better probes over a window, except that one
+//! answered probe lifts Offline to Degraded so requests stop failing fast.
 
 use std::time::{Duration, Instant};
 
@@ -123,6 +124,13 @@ impl LinkEstimator {
         if !self.established {
             self.established = true;
             self.state = target;
+            self.upgrade = None;
+            return;
+        }
+        if self.state == LinkState::Offline {
+            // The server answered: stop failing fast at once. Climbing past
+            // Degraded still needs the usual run of good probes.
+            self.state = target.max(LinkState::Degraded);
             self.upgrade = None;
             return;
         }
