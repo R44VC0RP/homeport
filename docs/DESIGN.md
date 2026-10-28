@@ -1,10 +1,16 @@
 # Homeport
 
-Homeport shows basebook's `~/dev` and `~/Downloads` in Finder on airbook,
-over Tailscale. Browsing is instant, files download on demand, and a bad or
-missing connection never hangs Finder.
+Homeport shows folders from another computer in Finder over Tailscale.
+Browsing is instant, files download on demand, and a bad or missing
+connection never hangs Finder.
 
-## Machines
+This document started as the design for one setup (basebook serving
+airbook) and keeps those names in examples. Since 0.5.0 the server also runs
+on Linux and Windows and speaks protocol 3; see
+[PROTOCOL.md](PROTOCOL.md) for the wire format and
+[SECURITY.md](SECURITY.md) for the security model.
+
+## Machines (the original setup)
 
 - **basebook** (server): always-on Mac, tailnet IP `100.84.220.87`, macOS 27,
   case-insensitive APFS. Runs `homeportd`.
@@ -46,12 +52,16 @@ basebook                                     airbook
 ### Rust workspace (`crates/`)
 
 - `homeport-proto`: messages (serde + postcard, length-prefixed), shared types.
-- `homeportd`: server binary. Runs as a LaunchAgent on basebook.
+- `homeportd`: server binary. Runs as a LaunchAgent (macOS), a systemd user
+  unit (Linux) or a boot-time scheduled task (Windows), installed with
+  `homeportd service install`. Platform code lives in
+  `crates/homeportd/src/platform/{macos,linux,windows}`.
 - `homeport-client`: async client library (quinn), link-quality estimator,
   priority scheduler, request coalescing. Used by the CLI and by Swift.
 - `homeport-cli`: `homeport ls|stat|cat|changes|bench|status` for headless
   testing against a live server.
 - `homeport-ffi`: UniFFI bindings over `homeport-client` for the Swift side.
+- `homeport-netsim`: UDP impairment proxy for testing on bad networks.
 
 ### Transport
 
@@ -64,7 +74,8 @@ basebook                                     airbook
 - TLS with a self-signed certificate generated on first run; the client pins
   its SHA-256 fingerprint.
 - Server binds only to the tailnet IP. Every connection is checked with
-  `tailscale whois --json <peer ip>`, cached; only Ryan's own user is allowed.
+  `tailscale whois --json <peer ip>`, cached; only allowed Tailscale logins
+  (default: the server node's owner) get in, and tagged devices never do.
 - Bulk content moves in 16–256 KiB pieces (about 100 ms of the link).
   Cancelling a File Provider `Progress` resets the stream.
 - Congestion control: BBR (`HOMEPORT_CC` picks cubic/newreno), with the
@@ -73,14 +84,17 @@ basebook                                     airbook
 
 ### Server index and change journal
 
-- Item identity: APFS file ID (`ATTR_CMN_FILEID`), stable across renames.
-  File Provider identifier = `"<fileid>"`; the two share roots are
-  `root:dev` and `root:Downloads`.
+- Item identity: on macOS the APFS file ID (`ATTR_CMN_FILEID`), stable
+  across renames; on Linux and Windows a number assigned by the index
+  (inode and FileId are kept to follow renames). File Provider identifier =
+  `"<id>"`; share roots are `root:<share>` (e.g. `root:dev`).
 - SQLite (WAL, `synchronous=NORMAL`): `items(file_id PK, parent_id, name,
   kind, size, mtime_ns, ctime_ns, mode, rev, content_rev, hash NULL)` with
   indexes on `(parent_id, name)` and `rev`.
-- Directories are listed with `getattrlistbulk` and cached pre-encoded per
-  directory with a directory revision (one round trip "not modified").
+- Directories are listed with `getattrlistbulk` (macOS), `getdents64` +
+  `statx` (Linux) or `FileIdExtdDirectoryInfo` (Windows) and cached
+  pre-encoded per directory with a directory revision (one round trip "not
+  modified").
 - Lazy indexing: a directory is scanned the first time any client lists it,
   then kept current. A background crawler fills the rest of the "human tree"
   on idle. Generated trees (`node_modules`, `.git`, `target`, `build`,
@@ -88,7 +102,8 @@ basebook                                     airbook
   when a client opens them.
 - FSEvents (`FileEvents | NoDefer`, ~100 ms latency), resumed from the stored
   event ID; volume UUID stored; `MustScanSubDirs` / dropped events trigger a
-  subtree rescan. FSEvents is only a hint: the anchor the client sees is the
+  subtree rescan. Linux uses inotify on indexed directories, Windows
+  `ReadDirectoryChangesExW`; both rescan after an overflow. FSEvents is only a hint: the anchor the client sees is the
   server's own monotonic `seq` plus a random `index_id`. A new `index_id`
   means the client must re-enumerate.
 - The change feed is filtered to directories the client has enumerated
@@ -109,8 +124,18 @@ basebook                                     airbook
 
 - Server-authoritative revisions. Uploads carry the base `content_rev`; a
   mismatch creates `name (airbook conflict YYYY-MM-DD HHMM).ext` beside it.
-- Server writes go to a temp file in the same directory, `F_FULLFSYNC`,
-  re-check, then `rename`. Deletes go to basebook's Trash.
+- Uploads are received into a staging file on the share's volume first.
+  Content replacement then differs by platform:
+  - macOS: the content is copied over the existing file in place (it keeps
+    its APFS file ID), after an APFS clone of the old content as a crash
+    backup, then `F_FULLFSYNC`.
+  - Linux: a temp file in the same directory (mode and `user.*` xattrs
+    copied), `fsync`, `renameat` over the target, `fsync` of the directory.
+  - Windows: the staged file replaces the target with a POSIX-semantics
+    rename (`FileRenameInformationEx`), keeping attributes and creation time.
+  The item keeps its Homeport id in all three. Deletes go to the server's
+  Trash (freedesktop Trash on Linux, Recycle Bin on Windows) and are refused
+  when that isn't possible.
 
 ### Link quality (client)
 
@@ -150,8 +175,10 @@ basebook                                     airbook
   the current folder; Good — metadata of the human tree; Wi-Fi — small files
   in top-k predicted folders, READMEs/manifests, newest Downloads; Wi-Fi + AC
   — larger files and pinned folders.
-- Thumbnails come from basebook (`QLThumbnailGenerator`) through
-  `NSFileProviderThumbnailing`, so Finder never downloads a file to draw it.
+- Thumbnails come from the server (`QLThumbnailGenerator` on macOS,
+  Explorer's thumbnail cache on Windows, the `image` crate plus `ffmpeg` and
+  `pdftoppm` when installed on Linux) through `NSFileProviderThumbnailing`,
+  so Finder never downloads a file to draw it.
 
 ### Metrics
 

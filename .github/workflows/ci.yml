@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  rust:
+    name: clippy + build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The server and the CLI build everywhere; the File Provider bindings
+          # (homeport-ffi) and the netsim proxy are macOS/Unix tools.
+          - os: ubuntu-latest
+            packages: -p homeportd -p homeport-cli
+          - os: windows-latest
+            packages: -p homeportd -p homeport-cli
+          - os: macos-latest
+            packages: --workspace
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --locked ${{ matrix.packages }} --all-targets -- -D warnings
+      - name: build
+        run: cargo build --locked ${{ matrix.packages }}
+
+  app:
+    name: Homeport.app (unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Build homeport-ffi and its Swift bindings
+        run: scripts/build-ffi.sh
+      - name: Build Homeport.app
+        working-directory: apple
+        run: |
+          xcodegen generate --quiet
+          xcodebuild -project Homeport.xcodeproj -scheme Homeport -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            build -quiet
+
+  installer:
+    name: installer (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: true }
+          - { os: macos-latest, target: aarch64-apple-darwin, zig: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, zig: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.zig
+        uses: mlugg/setup-zig@v2
+      - if: matrix.zig
+        run: pip install cargo-zigbuild
+      - name: Build the release archive
+        shell: bash
+        run: scripts/package.sh ${{ matrix.target }} ${{ matrix.zig && '--zig' || '' }}
+
+      - name: Check the binaries are static
+        if: runner.os == 'Linux'
+        run: |
+          file target/${{ matrix.target }}/release/homeportd
+          file target/${{ matrix.target }}/release/homeportd | grep -q 'statically linked'
+
+      - name: Install from the archive twice (upgrade in place)
+        if: runner.os != 'Windows'
+        env:
+          HOMEPORT_URL: ${{ github.workspace }}/dist/homeport-${{ matrix.target }}.tar.gz
+        run: |
+          script=scripts/install-linux.sh
+          [ "$RUNNER_OS" = macOS ] && script=scripts/install-macos.sh
+          mkdir -p "$HOME/shared folder"
+          sh "$script" --share "$HOME/shared folder" --name shared --no-service
+          sh "$script" --share "$HOME/shared folder" --name shared --no-service
+          "$HOME/.local/bin/homeportd" --version
+          "$HOME/.local/bin/homeport" --version
+          "$HOME/.local/bin/homeportd" share list | tee shares.txt
+          test "$(grep -c 'shared folder' shares.txt)" = 1
+
+      - name: Install the systemd user service, then upgrade it
+        if: runner.os == 'Linux'
+        env:
+          HOMEPORT_URL: ${{ github.workspace }}/dist/homeport-${{ matrix.target }}.tar.gz
+        run: |
+          # No Tailscale here, so homeportd itself keeps failing and restarting;
+          # this checks the unit is written, enabled, and kept on upgrade.
+          sh scripts/install-linux.sh --enable-linger
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"; export XDG_RUNTIME_DIR
+          systemctl --user is-enabled homeportd.service
+          cat ~/.config/systemd/user/homeportd.service
+          sh scripts/install-linux.sh | tee upgrade.txt
+          grep -q 'restarted homeportd.service' upgrade.txt
+          "$HOME/.local/bin/homeportd" service uninstall
+
+      - name: PSScriptAnalyzer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) { Install-Module PSScriptAnalyzer -Force -Scope CurrentUser }
+          $issues = Invoke-ScriptAnalyzer -Path scripts/install-windows.ps1 -Severity Warning,Error -ExcludeRule PSAvoidUsingWriteHost
+          $issues | Format-Table -AutoSize
+          if ($issues | Where-Object Severity -eq 'Error') { exit 1 }
+
+      - name: Install from the archive twice (upgrade in place)
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          HOMEPORT_URL: ${{ github.workspace }}\dist\homeport-${{ matrix.target }}.zip
+        run: |
+          $dir = Join-Path $env:USERPROFILE 'shared folder'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          .\scripts\install-windows.ps1 -Share "$dir=shared" -NoService
+          $out = .\scripts\install-windows.ps1 -Share "$dir=shared" -NoService 6>&1 | Out-String
+          $out
+          if ($out -notmatch 'Installed homeportd \d' -or $out -notmatch 'already shared') { throw 'unexpected installer output' }
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Homeport\homeportd.exe'
+          & $exe --version
+          & (Join-Path $env:LOCALAPPDATA 'Programs\Homeport\homeport.exe') --version
+          $list = & $exe share list | Out-String
+          $list
+          if (([regex]::Matches($list, 'shared folder')).Count -ne 1) { throw 'expected the share exactly once' }
