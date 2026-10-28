@@ -41,6 +41,10 @@ targets:
         LSUIElement: true
         NSAppleEventsUsageDescription: "Homeport reads which folder Finder shows so it can download the folders you are likely to open next."
         LSApplicationCategoryType: public.app-category.utilities
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.vogel.homeport.pair
+            CFBundleURLSchemes:
+              - homeport
         NSHumanReadableCopyright: "© 2026 Ryan Vogel"
     entitlements:
       path: Homeport/Homeport.entitlements

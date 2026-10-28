@@ -90,6 +90,7 @@ actor Prefetcher {
     private var queued: Set<String> = []
     private var running = 0
     private var crawlStarted = false
+    private var crawlRetried = false
     private var focus: String?
     private var stats = Stats()
     private var crawlStart: Date?
@@ -100,16 +101,31 @@ actor Prefetcher {
 
     func setRoot(_ url: URL) {
         root = url.standardizedFileURL
+        // The policy may have allowed the crawl before the root was known.
+        if policy.bulk && !crawlStarted {
+            beginCrawl(at: url.standardizedFileURL)
+            pump()
+        }
+    }
+
+    /// A new domain's root is itself dataless: download it first.
+    private func beginCrawl(at root: URL) {
+        crawlStarted = true
+        crawlStart = Date()
+        if lstatFlags(root).dataless {
+            queued.insert(root.path)
+            low.append(.folder(root, depth: 0))
+        } else {
+            scan.append((root, 0))
+        }
     }
 
     func setPolicy(_ p: PrefetchPolicy) {
         guard p != policy else { return }
-        log.notice("policy look-ahead=\(p.lookAhead) bulk=\(p.bulk)")
+        log.notice("policy \(self.root?.lastPathComponent ?? "-", privacy: .public) look-ahead=\(p.lookAhead) bulk=\(p.bulk)")
         policy = p
         if p.bulk && !crawlStarted, let root {
-            crawlStarted = true
-            crawlStart = Date()
-            scan.append((root, 0))
+            beginCrawl(at: root)
         }
         pump()
     }
@@ -118,7 +134,9 @@ actor Prefetcher {
 
     /// Finder's front window shows `url`; `selected` are its selected items.
     func focus(on url: URL, selected: [URL]) {
-        guard let root, url.standardizedFileURL.path.hasPrefix(root.path) else { return }
+        // Only this domain's tree ("Homeport-a" is not inside "Homeport-a (2)").
+        let path = url.standardizedFileURL.path
+        guard let root, path == root.path || path.hasPrefix(root.path + "/") else { return }
         let key = url.standardizedFileURL.path + "|" + selected.map(\.path).joined(separator: ",")
         guard key != focus else { return }
         focus = key
@@ -223,6 +241,17 @@ actor Prefetcher {
         }
         if low.isEmpty && scan.isEmpty && crawlStarted, let start = crawlStart {
             crawlStart = nil
+            if stats.folders == 0 && !crawlRetried, let root {
+                // A domain added moments ago lists nothing until the system
+                // has enumerated its root: look again shortly.
+                crawlRetried = true
+                Task {
+                    try? await Task.sleep(for: .seconds(5))
+                    self.beginCrawl(at: root)
+                    self.pump()
+                }
+                return
+            }
             let secs = Date().timeIntervalSince(start)
             log.notice("crawl done: \(self.stats.folders) folders in \(Int(secs)) s (\(String(format: "%.1f", Double(self.stats.folders) / max(secs, 1)), privacy: .public) /s), \(self.stats.failures) failures")
         }

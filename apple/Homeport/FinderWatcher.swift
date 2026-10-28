@@ -45,6 +45,24 @@ final class FinderWatcher {
         timer = t
     }
 
+    enum Permission {
+        case allowed, denied, undecided, unknown
+    }
+
+    /// Whether Homeport may send Apple events to Finder. With `ask`, macOS
+    /// shows its consent prompt if the person has not decided yet (this
+    /// blocks until they answer: call it off the main thread).
+    static func permission(ask: Bool) -> Permission {
+        let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.finder")
+        guard let desc = target.aeDesc else { return .unknown }
+        switch AEDeterminePermissionToAutomateTarget(desc, typeWildCard, typeWildCard, ask) {
+        case noErr: return .allowed
+        case OSStatus(errAEEventNotPermitted): return .denied
+        case OSStatus(errAEEventWouldRequireUserConsent): return .undecided
+        default: return .unknown
+        }
+    }
+
     /// Logs whether Homeport may send Apple events to Finder, without asking.
     private static func logPermission() {
         let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.finder")
