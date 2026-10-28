@@ -40,5 +40,34 @@ rustix = { version = "1.1", features = ["fs", "event", "time"] }
 # Server-side thumbnails of raster images (no Quick Look on Linux).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
 
+[target.'cfg(windows)'.dependencies]
+# Raw Win32/NT file APIs (handle-relative opens, FileIdExtd listings, change notifications).
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+# COM: the Recycle Bin (IFileOperation) and Explorer thumbnails (IShellItemImageFactory, WIC).
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+windows-core = "0.62"
+
 [lints]
 workspace = true

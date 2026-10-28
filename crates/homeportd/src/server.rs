@@ -61,6 +61,11 @@ pub fn transport_config() -> quinn::TransportConfig {
     t.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
     t.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
     t.send_window(32 * 1024 * 1024);
+    // Windows UDP segmentation offload (USO) over Tailscale's Wintun adapter
+    // breaks bulk reads: the macOS client aborts large transfers with "too
+    // many gaps in stream buffer". Without it exon-desk sends 130 MiB/s.
+    #[cfg(windows)]
+    t.enable_segmentation_offload(false);
     t
 }
 
