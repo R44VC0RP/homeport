@@ -1,5 +1,6 @@
 import AppKit
 import FileProvider
+import Network
 import os
 
 private let log = Logger(subsystem: "dev.vogel.homeport", category: "app")
@@ -24,6 +25,10 @@ final class AppModel: ObservableObject {
     private var timer: Timer?
     private var wasOffline: Bool?
     private var signalPending = false
+    private var prefetcher: Prefetcher?
+    private var finder: FinderWatcher?
+    private let pathMonitor = NWPathMonitor()
+    private var pathCheap = false
 
     let domain: NSFileProviderDomain = {
         let d = NSFileProviderDomain(
@@ -63,7 +68,31 @@ final class AppModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let cheap = path.status == .satisfied && !path.isExpensive && !path.isConstrained
+            Task { @MainActor in self?.pathCheap = cheap }
+        }
+        pathMonitor.start(queue: .main)
+        startPrefetcher()
         tick()
+    }
+
+    private func startPrefetcher() {
+        guard let manager else { return }
+        let p = Prefetcher(manager: manager)
+        prefetcher = p
+        manager.getUserVisibleURL(for: .rootContainer) { url, error in
+            guard let url else {
+                log.error("user visible URL: \(String(describing: error), privacy: .public)")
+                return
+            }
+            Task { await p.setRoot(url) }
+            let watcher = FinderWatcher { folder, selected in
+                Task { await p.focus(on: folder, selected: selected) }
+            }
+            watcher.start()
+            Task { @MainActor in self.finder = watcher }
+        }
     }
 
     /// Loads config.json, creating it on first launch from the local server's
@@ -107,6 +136,10 @@ final class AppModel: ObservableObject {
         if linkState != state { linkState = state }
         let text = Self.describe(l)
         if status != text { status = text }
+        let policy = PrefetchPolicy(
+            lookAhead: l.probed && l.state != .offline,
+            bulk: l.probed && l.state == .good && pathCheap)
+        if let prefetcher { Task { await prefetcher.setPolicy(policy) } }
         guard l.probed else { return }
         let offline = l.state == .offline
         defer { wasOffline = offline }

@@ -6,6 +6,8 @@ way an app sees them, then saves a unified log excerpt beside the results.
     python3 hpbench.py open 10      # open 10 small dataless files in visited folders
     python3 hpbench.py both 10
     python3 hpbench.py walk DIR     # list DIR, then each child folder (Finder-like)
+    python3 hpbench.py clicks 30    # random "clicks": dev -> repo -> subfolder ... (any state),
+                                    # then opens a random small file in each folder reached
 
 Prints one line per access and p50/p90/max. Writes the log to
 $TMPDIR/hpbench-<time>.log.
@@ -97,11 +99,39 @@ def run_walk(d):
     summary("walk", ts)
 
 
+def run_clicks(n):
+    """Random walks like a person clicking in Finder: a repo, then subfolders
+    down to depth 4, listing each (whatever its state) and opening one small
+    file in each folder reached."""
+    dev = os.path.join(ROOT, "dev")
+    repos = [d for d in os.listdir(dev) if not d.startswith(".") and os.path.isdir(os.path.join(dev, d))]
+    lists, opens = [], []
+    while len(lists) < n:
+        p = os.path.join(dev, random.choice(repos))
+        for _ in range(3):
+            lists.append(timed(ls, p))
+            names = [c for c in os.listdir(p) if not c.startswith(".")]
+            files = [os.path.join(p, c) for c in names
+                     if os.path.isfile(os.path.join(p, c)) and 0 < os.lstat(os.path.join(p, c)).st_size < 256 * 1024]
+            if files:
+                opens.append(timed(read, random.choice(files)))
+            subs = [os.path.join(p, c) for c in names
+                    if c not in SKIP and os.path.isdir(os.path.join(p, c)) and not os.path.islink(os.path.join(p, c))]
+            if not subs:
+                break
+            p = random.choice(subs)
+            time.sleep(0.3)
+    summary("click list", lists)
+    summary("click open", opens)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "both"
     start = time.time()
     if mode == "walk":
         run_walk(sys.argv[2])
+    elif mode == "clicks":
+        run_clicks(int(sys.argv[2]) if len(sys.argv) > 2 else 30)
     else:
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
         if mode in ("ls", "both"):

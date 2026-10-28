@@ -12,6 +12,8 @@ cp "$here/server.sha256" "$support/server.sha256"
 
 osascript -e 'tell application id "dev.vogel.homeport" to quit' >/dev/null 2>&1 || true
 pkill -x Homeport 2>/dev/null || true
+# The system relaunches the extension from the new bundle on next use.
+pkill -x HomeportFP 2>/dev/null || true
 rm -rf /Applications/Homeport.app
 ditto "$here/Homeport.app" /Applications/Homeport.app
 spctl --assess --type execute -v /Applications/Homeport.app
