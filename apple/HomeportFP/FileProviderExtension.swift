@@ -165,16 +165,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         var ids = firstTime ? smallFiles(in: dirId, excluding: opened, budget: 4 << 20, limit: 48) : []
         var kind = "beside"
         if ids.isEmpty, let dir = try? core.cachedItem(id: dirId) {
-            // Neighbouring folders' small files (their listings are cached
-            // when the crawl or Finder got there), then the parent's own.
+            // Small files of the folder's own subfolders, then of its
+            // neighbours (listings cached when the crawl or Finder got
+            // there), then of its parent. The parent's often come first in
+            // the crawl and are already on disk (no fetch, no effect: one
+            // airbook miss), so it is the last resort, and three are asked
+            // for in case some are already downloaded.
             kind = "near"
+            let want = 3
+            let children = ((try? core.page(dirId: dirId, offset: 0, limit: 2000)) ?? []).filter { $0.kind == .dir }
             let neighbours = ((try? core.page(dirId: dir.parentId, offset: 0, limit: 2000)) ?? [])
-                .filter { $0.kind == .dir && $0.id != dirId }.prefix(8)
-            for n in neighbours where ids.count < 2 {
-                ids += smallFiles(in: n.id, excluding: nil, budget: 256 << 10, limit: 2 - ids.count)
+                .filter { $0.kind == .dir && $0.id != dirId }
+            for n in (children.prefix(8) + neighbours.prefix(8)) where ids.count < want {
+                ids += smallFiles(in: n.id, excluding: nil, budget: 256 << 10, limit: want - ids.count)
             }
-            if ids.count < 2 {
-                ids += smallFiles(in: dir.parentId, excluding: nil, budget: 256 << 10, limit: 2 - ids.count)
+            if ids.count < want {
+                ids += smallFiles(in: dir.parentId, excluding: nil, budget: 256 << 10, limit: want - ids.count)
             }
         }
         guard !ids.isEmpty else { return }
@@ -184,6 +190,41 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 if let error { log.debug("nearby prefetch \(id, privacy: .public): \(String(describing: error), privacy: .public)") }
             }
         }
+    }
+
+    /// A user's first listing waiting for its folder to materialize.
+    private var pendingListing: (dirId: String, request: NSFileProviderRequest, at: Date)?
+
+    /// After a user's first listing, the folder's small files are fetched
+    /// once fileproviderd reports the folder materialized: that is when its
+    /// ~600 ms hold starts, and a fetch during the hold ends it. Fetching
+    /// right after the listing is served finishes before the hold begins
+    /// (airbook: no effect on first listings). Falls back to a timer.
+    func listedForUser(dirId: String, request: NSFileProviderRequest) {
+        if request.isSystemRequest || request.requestingExecutable?.path.contains("/Homeport.app/") == true { return }
+        lock.lock()
+        pendingListing = (dirId, request, Date())
+        lock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.firePendingListing(dirId: dirId, why: "timer")
+        }
+    }
+
+    private func firePendingListing(dirId: String?, why: String) {
+        lock.lock()
+        guard let p = pendingListing, dirId == nil || p.dirId == dirId, Date().timeIntervalSince(p.at) < 5 else {
+            lock.unlock()
+            return
+        }
+        pendingListing = nil
+        lock.unlock()
+        log.notice("listing \(p.dirId, privacy: .public) materialized (\(why, privacy: .public), \(Int(Date().timeIntervalSince(p.at) * 1000)) ms after listing)")
+        prefetchNearby(dirId: p.dirId, opened: nil, request: p.request)
+    }
+
+    func materializedItemsDidChange(completionHandler: @escaping () -> Void) {
+        firePendingListing(dirId: nil, why: "materializedItemsDidChange")
+        completionHandler()
     }
 
     /// Small files of a cached listing not yet fetched or requested by this

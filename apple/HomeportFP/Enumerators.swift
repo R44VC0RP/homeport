@@ -76,7 +76,7 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
                 observer.finishEnumerating(upTo: raw.count == Int(limit) ? PageCodec.encode(offset + limit) : nil)
                 // A first listing: its small files (or, for a folder without
                 // any, a neighbour's) also cut fileproviderd's hold short.
-                if fresh { self.ext.prefetchNearby(dirId: self.dirId, opened: nil, request: self.request) }
+                if fresh { self.ext.listedForUser(dirId: self.dirId, request: self.request) }
             } catch {
                 self.ext.noteOutcome(error)
                 log.error("list \(self.dirId, privacy: .public) failed: \(String(describing: error), privacy: .public)")
