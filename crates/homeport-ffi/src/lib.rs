@@ -351,9 +351,12 @@ struct Shared {
     pending: Mutex<Pending>,
     revalidating: Mutex<HashSet<String>>,
     /// Circuit breaker: set (to the probe count at the time) when a request
-    /// found the server unreachable. Until a later probe succeeds, requests
-    /// fail at once instead of each waiting out its deadline; the system
-    /// retries failed calls several times, which would multiply the wait.
+    /// found the server unreachable, which also asks for a probe at once.
+    /// While that probe (or a later one) misses, or the link is Offline,
+    /// requests fail at once instead of each waiting out its deadline (the
+    /// system retries failed calls several times, which would multiply the
+    /// wait). Until it answers, requests are tried as usual; the first
+    /// answered probe clears the breaker.
     tripped_at_probe: Mutex<Option<u64>>,
 }
 
@@ -396,11 +399,13 @@ impl Shared {
         let mut t = lock(&self.tripped_at_probe);
         let Some(at) = *t else { return Ok(()) };
         let link = self.client.link();
-        if link.probes > at && link.consecutive_misses == 0 {
-            *t = None;
-            return Ok(());
+        if link.consecutive_misses > 0 || (link.probes > 0 && link.state == LinkState::Offline) {
+            return Err(CoreError::Unreachable { msg: "server did not answer recently".into() });
         }
-        Err(CoreError::Unreachable { msg: "server did not answer recently".into() })
+        if link.probes > at {
+            *t = None;
+        }
+        Ok(())
     }
 
     fn note_result<T>(&self, r: &Result<T>) {
@@ -408,6 +413,7 @@ impl Shared {
             let mut t = lock(&self.tripped_at_probe);
             if t.is_none() {
                 *t = Some(self.client.link().probes);
+                self.client.probe_soon();
             }
         }
     }
