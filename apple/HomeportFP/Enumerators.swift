@@ -40,11 +40,13 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
     let ext: FileProviderExtension
     let core: Core
     let dirId: String
+    let request: NSFileProviderRequest
 
-    init(ext: FileProviderExtension, core: Core, dirId: String) {
+    init(ext: FileProviderExtension, core: Core, dirId: String, request: NSFileProviderRequest) {
         self.ext = ext
         self.core = core
         self.dirId = dirId
+        self.request = request
     }
 
     func invalidate() {}
@@ -56,11 +58,13 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
             let started = Date()
             do {
                 var offset: UInt32 = 0
+                var fresh = false
                 if initial {
                     let st = try await core.list(dirId: dirId)
                     let ms = Int(Date().timeIntervalSince(started) * 1000)
                     log.notice("list \(self.dirId, privacy: .public): \(st.total) items, cache=\(st.fromCache) stale=\(st.stale) in \(ms) ms")
                     if !st.fromCache { self.ext.noteOutcome(nil) }
+                    fresh = !st.fromCache
                     if self.core.hasPendingChanges() { self.ext.signalWorkingSet() }
                 } else {
                     offset = PageCodec.decode(page)
@@ -70,6 +74,9 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
                 let offline = shareRoots ? ext.isOffline : nil
                 observer.didEnumerate(raw.map { Item($0, offline: offline) })
                 observer.finishEnumerating(upTo: raw.count == Int(limit) ? PageCodec.encode(offset + limit) : nil)
+                // A first listing: its small files (or, for a folder without
+                // any, a neighbour's) also cut fileproviderd's hold short.
+                if fresh { self.ext.prefetchNearby(dirId: self.dirId, opened: nil, request: self.request) }
             } catch {
                 self.ext.noteOutcome(error)
                 log.error("list \(self.dirId, privacy: .public) failed: \(String(describing: error), privacy: .public)")

@@ -10,6 +10,8 @@ way an app sees them, then saves a unified log excerpt beside the results.
                                     # then opens a random small file in each folder reached
     python3 hpbench.py siblings 8   # in 8 deeper folders: open one dataless small file, wait 1 s,
                                     # then open 3 more beside it
+    python3 hpbench.py first 20     # one first open of a small dataless file in each of 20 folders
+    python3 hpbench.py deepls 20    # first visits of dataless folders below the crawl's depth
     python3 hpbench.py finder 8     # show 8 deeper folders in Finder (`open`), wait 3 s, then
                                     # open small files in them (needs Finder automation allowed)
 
@@ -172,6 +174,32 @@ def run_first(n):
     summary("first open in folder", ts)
 
 
+def run_deepls(n):
+    """First visits of dataless folders below the crawl's depth (or anywhere
+    the crawl skipped), found by walking materialized folders."""
+    dev = os.path.join(ROOT, "dev")
+    found, seen = [], 0
+    stack = [os.path.join(dev, d) for d in os.listdir(dev) if not d.startswith(".")]
+    random.shuffle(stack)
+    while stack and len(found) < n * 3 and seen < 20000:
+        p = stack.pop()
+        seen += 1
+        if os.path.islink(p) or not os.path.isdir(p):
+            continue
+        if dataless(p):
+            found.append(p)
+            continue
+        kids = [os.path.join(p, c) for c in os.listdir(p) if not c.startswith(".") and c not in SKIP]
+        random.shuffle(kids)
+        stack.extend(kids)
+    random.shuffle(found)
+    ts = []
+    for p in found[:n]:
+        ts.append(timed(ls, p))
+        time.sleep(2)
+    summary("first list (deep)", ts)
+
+
 def run_finder(n):
     ts = []
     for p, fs in deep_folders(n):
@@ -191,6 +219,8 @@ if __name__ == "__main__":
         run_siblings(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
     elif mode == "first":
         run_first(int(sys.argv[2]) if len(sys.argv) > 2 else 20)
+    elif mode == "deepls":
+        run_deepls(int(sys.argv[2]) if len(sys.argv) > 2 else 20)
     elif mode == "finder":
         run_finder(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
     elif mode == "clicks":

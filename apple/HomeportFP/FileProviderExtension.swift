@@ -138,35 +138,82 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         return progress
     }
 
-    /// Someone opened a file: the small files beside it are the likeliest
-    /// next opens, and each first open costs ~600 ms in fileproviderd on
-    /// macOS 26, so ask the system to download them now (Good, unmetered
-    /// links only; once per folder per process).
-    private func prefetchSiblings(of raw: FfiItem, request: NSFileProviderRequest) {
-        // Downloads that Homeport.app's prefetcher asked for don't count.
+    /// Someone opened a file in `dirId`, or listed `dirId` for the first
+    /// time. Two reasons to download small files nearby right away:
+    ///
+    /// - They are the likeliest next opens.
+    /// - On macOS 26, fileproviderd holds the opener for a flat ~600 ms
+    ///   after the item has materialized, and the hold ends early when
+    ///   another item's content is fetched meanwhile (airbook: first opens
+    ///   with siblings to fetch took 70-91 ms, lone files 362-716 ms;
+    ///   signalling the working set or re-requesting the parent or the item
+    ///   did not help). So when the folder has nothing left to fetch, one or
+    ///   two small files from neighbouring folders are fetched instead.
+    ///
+    /// Good, unmetered links only; user requests only (fetches that
+    /// prefetching itself caused are system requests).
+    func prefetchNearby(dirId: String, opened: String?, request: NSFileProviderRequest) {
         if request.isSystemRequest || request.requestingExecutable?.path.contains("/Homeport.app/") == true { return }
         guard let core, let manager else { return }
         let link = core.link()
         guard link.probed, link.state == .good else { return }
         lock.lock()
-        let allowed = pathCheap && siblingsRequested.insert(raw.parentId).inserted
+        let cheap = pathCheap
+        let firstTime = siblingsRequested.insert(dirId).inserted
         lock.unlock()
-        guard allowed, let siblings = try? core.page(dirId: raw.parentId, offset: 0, limit: 2000) else { return }
-        var budget: UInt64 = 4 << 20
-        var ids: [String] = []
-        for s in siblings.sorted(by: { $0.size < $1.size })
-        where s.kind == .file && s.id != raw.id && s.size > 0 && s.size < 256 * 1024 && !s.name.hasPrefix(".") {
-            guard s.size <= budget, ids.count < 48 else { break }
-            budget -= s.size
-            ids.append(s.id)
-        }
-        guard !ids.isEmpty else { return }
-        log.notice("prefetching \(ids.count) small files beside \(raw.id, privacy: .public) (opened by \(request.requestingExecutable?.lastPathComponent ?? "?", privacy: .public))")
-        for id in ids {
-            manager.requestDownloadForItem(withIdentifier: NSFileProviderItemIdentifier(id)) { error in
-                if let error { log.debug("sibling prefetch \(id, privacy: .public): \(String(describing: error), privacy: .public)") }
+        guard cheap else { return }
+        var ids = firstTime ? smallFiles(in: dirId, excluding: opened, budget: 4 << 20, limit: 48) : []
+        var kind = "beside"
+        if ids.isEmpty, let dir = try? core.cachedItem(id: dirId) {
+            // Neighbouring folders' small files (their listings are cached
+            // when the crawl or Finder got there), then the parent's own.
+            kind = "near"
+            let neighbours = ((try? core.page(dirId: dir.parentId, offset: 0, limit: 2000)) ?? [])
+                .filter { $0.kind == .dir && $0.id != dirId }.prefix(8)
+            for n in neighbours where ids.count < 2 {
+                ids += smallFiles(in: n.id, excluding: nil, budget: 256 << 10, limit: 2 - ids.count)
+            }
+            if ids.count < 2 {
+                ids += smallFiles(in: dir.parentId, excluding: nil, budget: 256 << 10, limit: 2 - ids.count)
             }
         }
+        guard !ids.isEmpty else { return }
+        log.notice("prefetching \(ids.count) small files \(kind, privacy: .public) \(opened ?? dirId, privacy: .public)")
+        for id in ids {
+            manager.requestDownloadForItem(withIdentifier: NSFileProviderItemIdentifier(id)) { error in
+                if let error { log.debug("nearby prefetch \(id, privacy: .public): \(String(describing: error), privacy: .public)") }
+            }
+        }
+    }
+
+    /// Small files of a cached listing not yet fetched or requested by this
+    /// process, smallest first; marks them requested.
+    private func smallFiles(in dirId: String, excluding: String?, budget: UInt64, limit: Int) -> [String] {
+        guard let core, let items = try? core.page(dirId: dirId, offset: 0, limit: 2000) else { return [] }
+        var budget = budget
+        var out: [String] = []
+        lock.lock()
+        defer { lock.unlock() }
+        for i in items.sorted(by: { $0.size < $1.size })
+        where i.kind == .file && i.id != excluding && i.size > 0 && i.size < 256 * 1024 && !i.name.hasPrefix(".")
+            && !filesRequested.contains(i.id) {
+            guard i.size <= budget, out.count < limit else { break }
+            budget -= i.size
+            out.append(i.id)
+        }
+        filesRequested.formUnion(out)
+        if filesRequested.count > 100_000 { filesRequested.removeAll() }
+        return out
+    }
+
+    /// Files fetched or requested by this process (so prefetch does not
+    /// ask for them again).
+    private var filesRequested: Set<String> = []
+
+    private func noteFetched(_ id: String) {
+        lock.lock()
+        filesRequested.insert(id)
+        lock.unlock()
     }
 
     private func tempURL() throws -> URL {
@@ -196,8 +243,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 raw.contentRev = done.contentRev
                 self.noteOutcome(nil)
                 log.notice("fetched \(id, privacy: .public) \(done.bytes) bytes in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
+                self.noteFetched(id)
                 completionHandler(url, Item(raw), nil)
-                self.prefetchSiblings(of: raw, request: request)
+                self.prefetchNearby(dirId: raw.parentId, opened: id, request: request)
             } catch {
                 self.noteOutcome(error)
                 log.error("fetch \(id, privacy: .public) failed after \(Int(Date().timeIntervalSince(started) * 1000)) ms: \(String(describing: error), privacy: .public)")
@@ -275,8 +323,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                                      : NSRange(location: Int(offset), length: Int(done.bytes))
                 self.noteOutcome(nil)
                 log.notice("fetched \(id, privacy: .public) range \(range.location)+\(range.length) in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
+                if len == 0 { self.noteFetched(id) }
                 completionHandler(url, Item(raw), range, [], nil)
-                self.prefetchSiblings(of: raw, request: request)
+                if len == 0 { self.prefetchNearby(dirId: raw.parentId, opened: id, request: request) }
             } catch {
                 self.noteOutcome(error)
                 log.error("partial fetch \(id, privacy: .public) failed: \(String(describing: error), privacy: .public)")
@@ -374,6 +423,6 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             return WorkingSetEnumerator(ext: self, core: core)
         }
         guard let id = ItemID.server(containerItemIdentifier) else { throw NSFileProviderError(.noSuchItem) }
-        return FolderEnumerator(ext: self, core: core, dirId: id)
+        return FolderEnumerator(ext: self, core: core, dirId: id, request: request)
     }
 }
