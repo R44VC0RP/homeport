@@ -431,9 +431,25 @@ impl Shared {
     /// Applies server changes to the cache; returns what the system should hear about.
     fn apply(&self, changed: Vec<CachedItem>, deleted: Vec<String>) -> Result<(Vec<CachedItem>, Vec<String>)> {
         let Some(mut c) = self.cache() else { return Ok((changed, deleted)) };
+        // A folder's first listing indexes it on the server, so its items come
+        // back in the change feed with the listing's own revisions. The
+        // system already has those from the enumeration: reporting them again
+        // makes fileproviderd reconcile every child a second time.
+        let mut unchanged = HashSet::new();
+        for i in &changed {
+            if let Some(old) = c.item(&i.item.id)?
+                && old.item == i.item
+                && old.link_target == i.link_target
+            {
+                unchanged.insert(i.item.id.clone());
+            }
+        }
         c.apply_changes(&changed, &deleted)?;
         let mut kept = Vec::with_capacity(changed.len());
         for i in changed {
+            if unchanged.contains(&i.item.id) {
+                continue;
+            }
             if i.item.parent_id == proto::ROOT_ID || c.dir(&i.item.parent_id)?.is_some() {
                 kept.push(i);
             }
