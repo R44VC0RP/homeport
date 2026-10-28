@@ -6,16 +6,18 @@
 
 mod fs;
 mod tags;
+mod trash;
 mod watch;
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub use fs::{Dir, File, Fs, Volume};
+pub use trash::Trash;
 pub use watch::Watcher;
 
-use super::{ServiceOps, SysOps, ThumbnailerOps, TrashOps, unix, unsupported};
+use super::{ServiceOps, SysOps, ThumbnailerOps, unix, unsupported};
 
 /// Process plumbing.
 pub struct Sys;
@@ -75,36 +77,6 @@ impl SysOps for Sys {
 
     fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         unix::write_private(path, bytes)
-    }
-}
-
-/// freedesktop.org Trash.
-pub struct Trash;
-
-impl TrashOps for Trash {
-    /// Home trash `$XDG_DATA_HOME/Trash` (`~/.local/share/Trash`) with
-    /// `files/` and `info/`.
-    fn open(_home: &Path, _data_dir: &Path) -> io::Result<Self> {
-        Err(unsupported("trash"))
-    }
-
-    /// Same filesystem as the home trash → home trash; else
-    /// `$topdir/.Trash/$uid` (sticky, not a symlink) or `$topdir/.Trash-$uid`.
-    /// Write `info/<name>.trashinfo` with `O_EXCL` (Path=percent-encoded
-    /// absolute path, DeletionDate) first, then `renameat2(NOREPLACE)` into
-    /// `files/<name>`; on collision add ` 2`, ` 3`... Return the new path.
-    fn trash(&self, _dir: &Dir, _name: &OsStr) -> io::Result<PathBuf> {
-        Err(unsupported("trash"))
-    }
-
-    /// Under any trash `files/` dir this instance uses.
-    fn contains(&self, _path: &Path) -> bool {
-        false
-    }
-
-    /// `renameat2(NOREPLACE)` back, then remove the `.trashinfo`.
-    fn put_back(&self, _from: &Path, _to_dir: &Dir, _to: &OsStr) -> io::Result<()> {
-        Err(unsupported("put back"))
     }
 }
 
