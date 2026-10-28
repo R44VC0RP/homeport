@@ -23,8 +23,8 @@ struct HomeportApp: App {
     }
 
     private var symbol: String {
-        guard let l = model.link, l.probed else { return "externaldrive.badge.questionmark" }
-        switch l.state {
+        guard let state = model.linkState else { return "externaldrive.badge.questionmark" }
+        switch state {
         case .good: return "externaldrive.connected.to.line.below"
         case .degraded, .poor: return "externaldrive.badge.exclamationmark"
         case .offline: return "externaldrive.badge.xmark"

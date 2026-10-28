@@ -7,7 +7,7 @@ set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
 out="$repo/apple/Generated"
 target=aarch64-apple-darwin
-export MACOSX_DEPLOYMENT_TARGET=15.0
+export MACOSX_DEPLOYMENT_TARGET=26.0
 
 cargo build --release --manifest-path "$repo/Cargo.toml" -p homeport-ffi --lib --target "$target"
 cargo build --release --manifest-path "$repo/Cargo.toml" -p homeport-ffi --features bindgen --bin uniffi-bindgen-swift

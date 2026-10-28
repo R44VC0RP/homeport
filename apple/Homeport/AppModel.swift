@@ -12,7 +12,9 @@ private final class ChangeForwarder: ChangeListener, @unchecked Sendable {
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var link: LinkInfo?
+    /// What the menu bar icon shows; published only when it changes, so the
+    /// status item is not redrawn on every tick.
+    @Published var linkState: LinkClass?
     @Published var status = "Starting…"
     @Published var server = HomeportConfig.defaultServer
     @Published var domainError: String?
@@ -101,8 +103,10 @@ final class AppModel: ObservableObject {
     private func tick() {
         guard let core else { return }
         let l = core.link()
-        link = l
-        status = Self.describe(l)
+        let state = l.probed ? l.state : nil
+        if linkState != state { linkState = state }
+        let text = Self.describe(l)
+        if status != text { status = text }
         guard l.probed else { return }
         let offline = l.state == .offline
         defer { wasOffline = offline }
@@ -138,7 +142,10 @@ final class AppModel: ObservableObject {
         case .offline: return "Offline"
         }
         if let rtt = l.pingMs ?? l.rttMs {
-            return String(format: "%@ · %.1f ms", state, rtt)
+            // Coarse steps, so jitter does not republish (and redraw) the
+            // status every second.
+            if rtt < 10 { return "\(state) · < 10 ms" }
+            return String(format: "%@ · %.0f ms", state, (rtt / 10).rounded() * 10)
         }
         return state
     }

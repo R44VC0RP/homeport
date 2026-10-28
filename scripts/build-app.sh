@@ -15,9 +15,14 @@ fi
 
 cd "$repo/apple"
 /opt/homebrew/bin/xcodegen generate --quiet
-xcodebuild -project Homeport.xcodeproj -scheme Homeport -configuration Release \
-  -derivedDataPath "$repo/build/DerivedData" build -quiet 2>&1 \
-  | grep -v -e "appintentsmetadataprocessor" -e "^ld: warning: object file" || true
+log="$repo/build/xcodebuild.log"
+mkdir -p "$repo/build"
+if ! xcodebuild -project Homeport.xcodeproj -scheme Homeport -configuration Release \
+  -derivedDataPath "$repo/build/DerivedData" build -quiet >"$log" 2>&1; then
+  grep -e "error:" -e "BUILD FAILED" "$log" >&2 || tail -20 "$log" >&2
+  exit 1
+fi
+grep -v -e "appintentsmetadataprocessor" -e "^ld: warning: object file" "$log" || true
 app="$repo/build/DerivedData/Build/Products/Release/Homeport.app"
 codesign --verify --deep --strict "$app"
 
