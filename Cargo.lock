@@ -721,6 +721,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "homeport-netsim"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "rand 0.9.5",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "homeport-proto"
 version = "0.1.0"
 dependencies = [
