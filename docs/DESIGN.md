@@ -65,9 +65,11 @@ basebook                                     airbook
   its SHA-256 fingerprint.
 - Server binds only to the tailnet IP. Every connection is checked with
   `tailscale whois --json <peer ip>`, cached; only Ryan's own user is allowed.
-- Bulk content moves in 256 KiB–1 MiB pieces so a P0 request is never queued
-  behind a big transfer. Cancelling a File Provider `Progress` resets the
-  stream.
+- Bulk content moves in 16–256 KiB pieces (about 100 ms of the link).
+  Cancelling a File Provider `Progress` resets the stream.
+- Congestion control: BBR (`HOMEPORT_CC` picks cubic/newreno), with the
+  window held to ~2 BDP, and ~1 BDP while a P0/P1 request is running, so
+  urgent answers do not wait behind a bulk transfer in the bottleneck queue.
 
 ### Server index and change journal
 
@@ -117,9 +119,17 @@ basebook                                     airbook
   (every 5 s while active, 30–60 s idle), `tailscale status --json` for
   direct vs DERP.
 - States: Good, Degraded (RTT > 300 ms, loss > 3 %, or < 2 Mbps), Poor
-  (RTT > 270 ms *and* < 700 kbps, or RTT > 1.4 s), Offline.
-- Hysteresis: drop to Offline after ~3 missed pings (6–10 s) or an
-  unsatisfied path; climb back only after 2–3 good probes over 15–30 s.
+  (RTT > 270 ms *and* < 700 kbps, or loss > 6 % when no transfer measured
+  the rate, or RTT > 1.4 s), Offline.
+- RTT, loss and throughput are windowed (min RTT over 10 s, loss over
+  30 s excluding outages, best delivery rate while a transfer runs), so the
+  state follows the link of the last few seconds.
+- Hysteresis: drop to Offline after 2 back-to-back missed pings (~3 s on a
+  fast link) or an unsatisfied path; one answered ping lifts Offline to
+  Degraded, and a better class must hold 8 s before the state climbs.
+- Deadlines are progress-based: a request fails when no bytes arrive for
+  ~1 s (stretched to ~5 RTT on long paths), not when a big response is
+  slow, and at once when the link is Offline.
 - Offline: listings answer from the local copy; fetches of missing data fail
   fast with `serverUnreachable`. On reconnect call
   `signalErrorResolved(.serverUnreachable)` and signal the working set.
