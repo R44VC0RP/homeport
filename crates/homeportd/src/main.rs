@@ -192,7 +192,7 @@ fn config_path(given: Option<PathBuf>, home: &Path) -> PathBuf {
     given.unwrap_or_else(|| Sys::config_dir(home).join("server.toml"))
 }
 
-/// Shares from the config, else the platform defaults (`true` if defaults).
+/// Shares from the config, else the platform defaults (none on any OS; `true` if defaults).
 fn config_shares(cfg: &Config, home: &Path) -> (Vec<(String, PathBuf)>, bool) {
     match &cfg.shares {
         Some(s) => (s.iter().map(|s| (s.name.clone(), config::expand(&s.path, home))).collect(), false),

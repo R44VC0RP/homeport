@@ -235,7 +235,10 @@ async fn run(args: Args) -> Result<(), CliError> {
         let shares: Vec<&str> = p.roots.iter().map(|r| r.name.as_str()).collect();
         println!("name         {}", p.server.name);
         println!("os           {:?} (homeportd {})", p.server.os, p.server.version);
-        println!("case         sensitive={} normalization_sensitive={}", p.server.case_sensitive, p.server.normalization_sensitive);
+        println!(
+            "case         sensitive={} normalization_sensitive={}",
+            p.server.case_sensitive, p.server.normalization_sensitive
+        );
         println!("caps         {:#x}", p.server.caps);
         println!("shares       {}", shares.join(", "));
         println!("fingerprint  {fp}");
@@ -387,7 +390,17 @@ async fn run(args: Args) -> Result<(), CliError> {
                     .ok_or_else(|| CliError::Usage("no name".into()))?;
                 let op = format!("cli-{:016x}", rand::random::<u64>());
                 let item = c
-                    .create(&op, &target.id, &name, Kind::File, None, Meta::default(), false, Some(up), Priority::UserOpen)
+                    .create(
+                        &op,
+                        &target.id,
+                        &name,
+                        Kind::File,
+                        None,
+                        Meta::default(),
+                        false,
+                        Some(up),
+                        Priority::UserOpen,
+                    )
                     .await?;
                 print_item(&mut out, &item)?;
             }
@@ -396,7 +409,8 @@ async fn run(args: Args) -> Result<(), CliError> {
         Cmd::Mkdir { dir, name } => {
             let d = target_item(&c, &dir).await?;
             let op = format!("cli-{:016x}", rand::random::<u64>());
-            let item = c.create(&op, &d.id, &name, Kind::Dir, None, Meta::default(), false, None, Priority::Visible).await?;
+            let item =
+                c.create(&op, &d.id, &name, Kind::Dir, None, Meta::default(), false, None, Priority::Visible).await?;
             print_item(&mut out, &item)?;
         }
         Cmd::Mv { target, to, name } => {

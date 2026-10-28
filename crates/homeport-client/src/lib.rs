@@ -474,7 +474,12 @@ pub struct Upload<'a> {
 impl Client {
     /// Sends a write request, followed by `upload`'s content, and returns
     /// its one answer.
-    async fn write_request(&self, priority: Priority, body: RequestBody, upload: Option<Upload<'_>>) -> Result<Response> {
+    async fn write_request(
+        &self,
+        priority: Priority,
+        body: RequestBody,
+        upload: Option<Upload<'_>>,
+    ) -> Result<Response> {
         let inner = self.inner.clone();
         *lock(&inner.last_activity) = Instant::now();
         if lock(&inner.link).fail_fast() {
@@ -1111,8 +1116,13 @@ pub async fn probe(server: SocketAddr, timeout: Duration) -> Result<Probe> {
     let hello = async {
         let conn = endpoint.connect_with(qc, server, proto::SERVER_NAME).map_err(|e| Error::Config(e.to_string()))?;
         let conn = conn.await.map_err(|e| match e {
-            quinn::ConnectionError::ConnectionClosed(ref c) if c.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED => {
-                Error::Server { code: ErrorCode::Denied, message: "the server does not allow this Tailscale login".into() }
+            quinn::ConnectionError::ConnectionClosed(ref c)
+                if c.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED =>
+            {
+                Error::Server {
+                    code: ErrorCode::Denied,
+                    message: "the server does not allow this Tailscale login".into(),
+                }
             }
             e => e.into(),
         })?;

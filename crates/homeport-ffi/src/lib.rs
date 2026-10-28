@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures::StreamExt;
-use homeport_client::{ChangeEvent, Client, Config, Error as ClientError, ListResult, LinkState};
+use homeport_client::{ChangeEvent, Client, Config, Error as ClientError, LinkState, ListResult};
 use homeport_proto::{self as proto, ErrorCode, Item, Kind, Meta, Priority};
 
 use cache::{Cache, CachedItem};
@@ -345,8 +345,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Names never shown to the system (Finder metadata from the server's disk).
 fn is_noise(name: &str) -> bool {
-    matches!(name, ".DS_Store" | ".localized" | ".Spotlight-V100" | ".Trashes" | ".fseventsd" | ".TemporaryItems" | "Icon\r")
-        || name.starts_with("._")
+    matches!(
+        name,
+        ".DS_Store" | ".localized" | ".Spotlight-V100" | ".Trashes" | ".fseventsd" | ".TemporaryItems" | "Icon\r"
+    ) || name.starts_with("._")
 }
 
 #[derive(Default)]
@@ -961,17 +963,8 @@ impl Core {
                 None => None,
             };
             let upload = file.map(|f| homeport_client::Upload { file: f, size, progress: &report });
-            let fut = s.client.create(
-                &op_id,
-                &parent_id,
-                &name,
-                kind,
-                link_target,
-                meta.into(),
-                may_exist,
-                upload,
-                priority,
-            );
+            let fut =
+                s.client.create(&op_id, &parent_id, &name, kind, link_target, meta.into(), may_exist, upload, priority);
             let r = tokio::select! {
                 r = fut => r.map_err(|e| write_error(&s, e)),
                 _ = cancelled.wait_for(|c| *c) => Err(CoreError::Cancelled),
@@ -1040,7 +1033,11 @@ impl Core {
     ) -> Result<FfiItem> {
         self.run(move |s: Arc<Shared>| async move {
             let old_parent = s.cache().and_then(|c| c.item(&id).ok().flatten()).map(|c| c.item.parent_id);
-            let r = s.guarded(async { s.client.modify(&id, new_parent_id, new_name, meta.into()).await.map_err(|e| write_error(&s, e)) }).await;
+            let r = s
+                .guarded(async {
+                    s.client.modify(&id, new_parent_id, new_name, meta.into()).await.map_err(|e| write_error(&s, e))
+                })
+                .await;
             let item = r?;
             Ok(s.store_written(item, old_parent, None)?.into())
         })
@@ -1052,7 +1049,9 @@ impl Core {
     pub async fn trash_item(&self, id: String, listed: bool, recursive: bool) -> Result<FfiItem> {
         self.run(move |s: Arc<Shared>| async move {
             let old_parent = s.cache().and_then(|c| c.item(&id).ok().flatten()).map(|c| c.item.parent_id);
-            let item = s.guarded(async { s.client.trash(&id, listed, recursive).await.map_err(|e| write_error(&s, e)) }).await?;
+            let item = s
+                .guarded(async { s.client.trash(&id, listed, recursive).await.map_err(|e| write_error(&s, e)) })
+                .await?;
             if listed {
                 Ok(s.store_written(item, old_parent, None)?.into())
             } else {
@@ -1068,8 +1067,9 @@ impl Core {
     /// Puts a trash container item back as `parent_id/name`.
     pub async fn untrash_item(&self, id: String, parent_id: String, name: String) -> Result<FfiItem> {
         self.run(move |s: Arc<Shared>| async move {
-            let item =
-                s.guarded(async { s.client.untrash(&id, &parent_id, &name).await.map_err(|e| write_error(&s, e)) }).await?;
+            let item = s
+                .guarded(async { s.client.untrash(&id, &parent_id, &name).await.map_err(|e| write_error(&s, e)) })
+                .await?;
             Ok(s.store_written(item, Some(proto::TRASH_ID.to_owned()), None)?.into())
         })
         .await
@@ -1185,10 +1185,8 @@ fn resolve_addr(s: &str) -> Result<SocketAddr> {
         format!("{s}:{}", proto::DEFAULT_PORT)
     };
     use std::net::ToSocketAddrs;
-    let mut addrs: Vec<SocketAddr> = with_port
-        .to_socket_addrs()
-        .map_err(|e| CoreError::Config { msg: format!("server {s:?}: {e}") })?
-        .collect();
+    let mut addrs: Vec<SocketAddr> =
+        with_port.to_socket_addrs().map_err(|e| CoreError::Config { msg: format!("server {s:?}: {e}") })?.collect();
     addrs.sort_by_key(|a| !a.is_ipv4());
     addrs.into_iter().next().ok_or_else(|| CoreError::Config { msg: format!("server {s:?}: no address") })
 }

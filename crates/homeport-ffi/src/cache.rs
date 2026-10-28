@@ -98,22 +98,22 @@ fn upsert(tx: &Connection, c: &CachedItem) -> rusqlite::Result<()> {
     tx.prepare_cached(&format!(
         "INSERT OR REPLACE INTO items ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
     ))?
-        .execute(params![
-            i.id,
-            i.parent_id,
-            i.name,
-            kind_to_i64(i.kind),
-            i.size as i64,
-            i.mtime_ns,
-            i.ctime_ns,
-            i.mode as i64,
-            i.rev as i64,
-            i.content_rev as i64,
-            c.link_target,
-            i.crtime_ns,
-            i64::from(i.flags),
-            i.tags
-        ])?;
+    .execute(params![
+        i.id,
+        i.parent_id,
+        i.name,
+        kind_to_i64(i.kind),
+        i.size as i64,
+        i.mtime_ns,
+        i.ctime_ns,
+        i.mode as i64,
+        i.rev as i64,
+        i.content_rev as i64,
+        c.link_target,
+        i.crtime_ns,
+        i64::from(i.flags),
+        i.tags
+    ])?;
     Ok(())
 }
 
@@ -122,9 +122,10 @@ impl Cache {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
         // Columns added with protocol 2.
-        let has: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'crtime_ns'", [], |r| {
-            r.get::<_, i64>(0).map(|n| n > 0)
-        })?;
+        let has: bool =
+            db.query_row("SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'crtime_ns'", [], |r| {
+                r.get::<_, i64>(0).map(|n| n > 0)
+            })?;
         if !has {
             db.execute_batch(
                 "ALTER TABLE items ADD COLUMN crtime_ns INTEGER NOT NULL DEFAULT 0;
@@ -177,9 +178,9 @@ impl Cache {
     }
 
     pub fn page(&self, dir: &str, offset: u32, limit: u32) -> rusqlite::Result<Vec<CachedItem>> {
-        let mut st = self
-            .db
-            .prepare_cached(&format!("SELECT {COLS} FROM items WHERE parent_id = ?1 ORDER BY name LIMIT ?2 OFFSET ?3"))?;
+        let mut st = self.db.prepare_cached(&format!(
+            "SELECT {COLS} FROM items WHERE parent_id = ?1 ORDER BY name LIMIT ?2 OFFSET ?3"
+        ))?;
         st.query_map(params![dir, limit, offset], row_to_item)?.collect()
     }
 

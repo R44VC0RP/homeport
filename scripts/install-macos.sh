@@ -113,8 +113,7 @@ case ":$PATH:" in
 esac
 
 # 3. Shares. Only ever added; an existing config is never rewritten otherwise.
-# Without a shares list homeportd serves built-in defaults (~/dev and
-# ~/Downloads), so a new config starts with an explicit empty list.
+# A new config starts with an explicit empty list.
 start_config() {
   if [ ! -e "$config" ]; then
     mkdir -p "$(dirname "$config")"
@@ -153,8 +152,7 @@ fi
 
 if [ ! -e "$config" ]; then
   say
-  say "No config yet, so homeportd would serve its defaults (~/dev and ~/Downloads)."
-  say "Share the folders you want instead, then start the server:"
+  say "No folders are shared yet. Share the folders you want, then start the server:"
   say "  $hpd share add <folder>"
   say "  $hpd service install"
   exit 0

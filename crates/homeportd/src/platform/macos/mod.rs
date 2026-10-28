@@ -41,8 +41,8 @@ impl SysOps for Sys {
         home.join("Library/Caches/Homeport")
     }
 
-    fn default_shares(home: &Path) -> Vec<(String, PathBuf)> {
-        vec![("dev".to_owned(), home.join("dev")), ("Downloads".to_owned(), home.join("Downloads"))]
+    fn default_shares(_home: &Path) -> Vec<(String, PathBuf)> {
+        Vec::new()
     }
 
     fn host_name() -> String {
