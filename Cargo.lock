@@ -745,6 +745,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "rusqlite",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

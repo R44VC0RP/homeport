@@ -34,5 +34,9 @@ libc.workspace = true
 # sendmsg_x/recvmsg_x batching on macOS: several times the packet rate at a 1232-byte MTU.
 quinn-udp.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# statx, getdents64, openat2, renameat2, inotify, xattrs, FICLONE.
+rustix = { version = "1.1", features = ["fs", "event", "time"] }
+
 [lints]
 workspace = true
