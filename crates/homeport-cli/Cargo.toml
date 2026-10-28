@@ -1,0 +1,25 @@
+[package]
+name = "homeport-cli"
+description = "Headless Homeport client for testing a live server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "homeport"
+path = "src/main.rs"
+
+[dependencies]
+homeport-client.workspace = true
+homeport-proto.workspace = true
+clap.workspace = true
+futures.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
