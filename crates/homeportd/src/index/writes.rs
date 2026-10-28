@@ -664,7 +664,14 @@ impl Index {
         }
         let (path, share) = match self.resolve_any(&id)? {
             Target::Path { path, share } => (path, share),
-            Target::Trashed { .. } => return self.trashed_item(&id)?.ok_or(IndexError::NotFound),
+            Target::Trashed { .. } => {
+                let item = self.trashed_item(&id)?.ok_or(IndexError::NotFound)?;
+                if !listed {
+                    // Deleted from the client's trash: it stays in basebook's.
+                    self.forget(&id).await?;
+                }
+                return Ok(item);
+            }
             Target::Root => return Err(IndexError::Denied),
         };
         let this = self.clone();

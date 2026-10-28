@@ -176,7 +176,12 @@ async fn handle_stream(ctx: &Conn, mut send: SendStream, mut recv: RecvStream) -
         Err(e) => return Err(e),
     }
     send.finish()?;
-    tracing::debug!(kind, us = started.elapsed().as_micros() as u64, "request");
+    let us = started.elapsed().as_micros() as u64;
+    if us > 500_000 {
+        tracing::info!(kind, ms = us / 1000, "slow request");
+    } else {
+        tracing::debug!(kind, us, "request");
+    }
     Ok(())
 }
 
