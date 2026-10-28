@@ -77,7 +77,7 @@ function Test-TaskInstalled {
     $LASTEXITCODE -eq 0
 }
 
-function Test-Shares {
+function Test-HasShare {
     $list = Invoke-Native $Exe share list
     ($LASTEXITCODE -eq 0) -and ($list -notmatch 'no shares;')
 }
@@ -182,18 +182,18 @@ try {
         Copy-Item -Force $newCli $Cli
         Unblock-File $Cli
     }
-    Write-Host "Installed $((Invoke-Native $Exe --version).Trim()) in $InstallDir"
+    Write-Host "Installed $((Invoke-Native $Exe '--version').Trim()) in $InstallDir"
 } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
 }
 
 # 3. Shares (in %APPDATA%\Homeport\server.toml). Only ever added.
 foreach ($s in $Share) { Add-Share $s }
-if (-not (Test-Shares) -and [Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost') {
+if (-not (Test-HasShare) -and [Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost') {
     $answer = Read-Host 'Folder to share with your Mac (empty to skip)'
     if ($answer) { Add-Share $answer }
 }
-if (-not (Test-Shares)) {
+if (-not (Test-HasShare)) {
     Write-Host ''
     Write-Host 'No folders are shared yet. Share one and start the server (elevated):'
     Write-Host "  & '$Exe' share add <folder>"
@@ -244,7 +244,7 @@ if (-not $NoService) {
     }
 }
 Write-Host ''
-$null = Invoke-Native $Exe pair --help
+$null = Invoke-Native $Exe pair '--help'
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Next: run '& `"$Exe`" pair' and open the link it prints on your Mac (or enter its 6-digit code in Homeport)."
 } else {

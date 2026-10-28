@@ -121,6 +121,21 @@ jobs:
           "$HOME/.local/bin/homeportd" share list | tee shares.txt
           test "$(grep -c 'shared folder' shares.txt)" = 1
 
+      - name: Install the systemd user service, then upgrade it
+        if: runner.os == 'Linux'
+        env:
+          HOMEPORT_URL: ${{ github.workspace }}/dist/homeport-${{ matrix.target }}.tar.gz
+        run: |
+          # No Tailscale here, so homeportd itself keeps failing and restarting;
+          # this checks the unit is written, enabled, and kept on upgrade.
+          sh scripts/install-linux.sh --enable-linger
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"; export XDG_RUNTIME_DIR
+          systemctl --user is-enabled homeportd.service
+          cat ~/.config/systemd/user/homeportd.service
+          sh scripts/install-linux.sh | tee upgrade.txt
+          grep -q 'restarted homeportd.service' upgrade.txt
+          "$HOME/.local/bin/homeportd" service uninstall
+
       - name: PSScriptAnalyzer
         if: runner.os == 'Windows'
         shell: pwsh
@@ -139,7 +154,9 @@ jobs:
           $dir = Join-Path $env:USERPROFILE 'shared folder'
           New-Item -ItemType Directory -Force $dir | Out-Null
           .\scripts\install-windows.ps1 -Share "$dir=shared" -NoService
-          .\scripts\install-windows.ps1 -Share "$dir=shared" -NoService
+          $out = .\scripts\install-windows.ps1 -Share "$dir=shared" -NoService 6>&1 | Out-String
+          $out
+          if ($out -notmatch 'Installed homeportd \d' -or $out -notmatch 'already shared') { throw 'unexpected installer output' }
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\Homeport\homeportd.exe'
           & $exe --version
           & (Join-Path $env:LOCALAPPDATA 'Programs\Homeport\homeport.exe') --version

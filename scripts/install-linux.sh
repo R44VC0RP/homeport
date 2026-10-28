@@ -186,30 +186,45 @@ if [ "$watches" -gt 0 ] && [ "$watches" -lt 524288 ]; then
 fi
 
 # 5. The service.
+# The user manager's bus, for sessions without XDG_RUNTIME_DIR (su, some ssh
+# setups); it exists while the user is logged in or lingering.
+user_bus() {
+  [ -n "${XDG_RUNTIME_DIR:-}" ] && return 0
+  [ -S "/run/user/$(id -u)/bus" ] || return 1
+  XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  export XDG_RUNTIME_DIR
+}
+user=$(id -un)
 if [ "$service" = 0 ]; then
   say "skipped the service (--no-service); start it with: $hpd service install"
-elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user show-environment >/dev/null 2>&1; then
-  warn "no systemd user manager here; run '$hpd' under your own supervisor"
+elif ! command -v systemctl >/dev/null 2>&1; then
+  warn "systemd was not found; run '$hpd' under your own supervisor"
 else
-  user=$(id -un)
-  if [ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null)" != yes ] && [ "$linger" = 1 ]; then
+  if [ "$linger" = 1 ] && [ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null)" != yes ]; then
     sudo loginctl enable-linger "$user" || warn "could not enable lingering"
+    i=0
+    while ! user_bus && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
   fi
-  unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/homeportd.service"
-  if [ -f "$unit" ] && [ $# -eq 0 ] && grep -q "^ExecStart=$hpd" "$unit"; then
-    # An upgrade: keep the unit (and any arguments it was installed with).
-    systemctl --user restart homeportd.service
-    say "restarted homeportd.service"
-  elif [ $# -gt 0 ]; then
-    "$hpd" service install -- "$@"
+  user_bus || true
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    warn "no systemd user manager in this session; log in normally (not with su) or pass --enable-linger, then run: $hpd service install"
   else
-    "$hpd" service install
+    unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/homeportd.service"
+    if [ -f "$unit" ] && [ $# -eq 0 ] && grep -q "^ExecStart=$hpd" "$unit"; then
+      # An upgrade: keep the unit (and any arguments it was installed with).
+      systemctl --user restart homeportd.service
+      say "restarted homeportd.service"
+    elif [ $# -gt 0 ]; then
+      "$hpd" service install -- "$@"
+    else
+      "$hpd" service install
+    fi
+    state="${XDG_STATE_HOME:-$HOME/.local/state}/homeport/server"
+    i=0
+    while [ ! -f "$state/cert.sha256" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+    say
+    "$hpd" service status || true
   fi
-  state="${XDG_STATE_HOME:-$HOME/.local/state}/homeport/server"
-  i=0
-  while [ ! -f "$state/cert.sha256" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
-  say
-  "$hpd" service status || true
 fi
 
 # 6. Pairing.
