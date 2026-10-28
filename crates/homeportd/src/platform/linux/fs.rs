@@ -1,7 +1,7 @@
 //! Filesystem access on Linux: `getdents64` + `statx` directory scans, `*at`
 //! calls relative to directory descriptors, and `openat2(RESOLVE_BENEATH |
-//! RESOLVE_NO_SYMLINKS)` so that a path inside a share can never be steered
-//! out of it by a symlink in any component.
+//! RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV)` so that a path inside a share can
+//! never be steered out of it by a symlink or a mount in any component.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
@@ -104,7 +104,10 @@ pub(super) fn open_confined(path: &Path, flags: OFlags) -> io::Result<OwnedFd> {
         let rel = if rel.as_os_str().is_empty() { Path::new(".") } else { rel };
         let rootfd =
             rustix::fs::open(&root, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(err)?;
-        let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+        // NO_XDEV: never into another filesystem mounted inside the share (scans
+        // show those as Kind::Other).
+        let resolve =
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV;
         let open = || rustix::fs::openat2(&rootfd, rel, flags, Mode::empty(), resolve);
         let mut r = open();
         // EAGAIN: a concurrent rename somewhere on the system; try again.
@@ -117,6 +120,9 @@ pub(super) fn open_confined(path: &Path, flags: OFlags) -> io::Result<OwnedFd> {
         match r {
             // Linux < 5.6: confine the last component only (below).
             Err(rustix::io::Errno::NOSYS) => {}
+            // A mount point (or `..` out of the share) on the way: to clients
+            // it is an item of kind Other, not a directory.
+            Err(rustix::io::Errno::XDEV) => return Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
             r => return r.map_err(err),
         }
     }
