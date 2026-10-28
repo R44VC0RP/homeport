@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use homeport_client::{ChangeEvent, Client, Config, Error as ClientError, ListResult, LinkState};
-use homeport_proto::{self as proto, ErrorCode, Item, Kind, Priority};
+use homeport_proto::{self as proto, ErrorCode, Item, Kind, Meta, Priority};
 
 use cache::{Cache, CachedItem};
 
@@ -46,6 +46,17 @@ pub enum CoreError {
     Io { msg: String },
     #[error("configuration: {msg}")]
     Config { msg: String },
+    /// The name is taken by item `id` (now in the cache).
+    #[error("name is taken by {id}")]
+    Collision { id: String },
+    #[error("folder is not empty")]
+    NotEmpty,
+    #[error("server disk is full")]
+    NoSpace,
+    /// The server refused the change for good (permissions, bad name,
+    /// unsupported item); retrying will not help.
+    #[error("rejected: {msg}")]
+    Rejected { msg: String },
 }
 
 impl From<ClientError> for CoreError {
@@ -59,7 +70,37 @@ impl From<ClientError> for CoreError {
             ClientError::AnchorExpired { index_id, seq } => Self::AnchorExpired { index_id, seq },
             e @ ClientError::Protocol(_) => Self::Server { msg: e.to_string() },
             ClientError::Config(msg) => Self::Config { msg },
+            ClientError::Collision(item) => Self::Collision { id: item.id },
+            ClientError::Local(msg) => Self::Io { msg },
         }
+    }
+}
+
+/// Errors of write calls: permanent refusals are told apart from transient
+/// failures, and the item a collision names is cached for the caller.
+fn write_error(s: &Shared, e: ClientError) -> CoreError {
+    match e {
+        ClientError::Collision(item) => {
+            let id = item.id.clone();
+            if let Err(e) = s.store_written(*item, None, None) {
+                tracing::warn!(error = %e, "caching a collision's item");
+            }
+            CoreError::Collision { id }
+        }
+        ClientError::Server { code: ErrorCode::NotEmpty, .. } => CoreError::NotEmpty,
+        ClientError::Server { code: ErrorCode::NoSpace, .. } => CoreError::NoSpace,
+        ClientError::Server {
+            code:
+                ErrorCode::Denied
+                | ErrorCode::BadName
+                | ErrorCode::OutsideShare
+                | ErrorCode::Unsupported
+                | ErrorCode::BadRequest
+                | ErrorCode::NotADirectory
+                | ErrorCode::NotAFile,
+            message,
+        } => CoreError::Rejected { msg: message },
+        e => e.into(),
     }
 }
 
@@ -113,6 +154,12 @@ pub struct FfiItem {
     pub content_rev: u64,
     /// Relative target inside the same share (symlinks only).
     pub symlink_target: Option<String>,
+    /// 0 when unknown.
+    pub crtime_ns: i64,
+    /// BSD flags (`UF_HIDDEN` = 0x8000).
+    pub flags: u32,
+    /// Finder tags (raw `_kMDItemUserTags` value).
+    pub tags: Option<Vec<u8>>,
 }
 
 impl From<CachedItem> for FfiItem {
@@ -135,8 +182,49 @@ impl From<CachedItem> for FfiItem {
             rev: i.rev,
             content_rev: i.content_rev,
             symlink_target: c.link_target,
+            crtime_ns: i.crtime_ns,
+            flags: i.flags,
+            tags: i.tags,
         }
     }
+}
+
+/// Metadata to apply on the server; `None` leaves a field alone.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct FfiMeta {
+    pub mtime_ns: Option<i64>,
+    pub crtime_ns: Option<i64>,
+    pub mode: Option<u32>,
+    pub hidden: Option<bool>,
+    /// Whether `tags` should be applied (`tags == None` then removes them).
+    pub set_tags: bool,
+    pub tags: Option<Vec<u8>>,
+    pub xattrs: HashMap<String, Vec<u8>>,
+}
+
+impl From<FfiMeta> for Meta {
+    fn from(m: FfiMeta) -> Self {
+        let mut xattrs: Vec<(String, Vec<u8>)> = m.xattrs.into_iter().collect();
+        xattrs.sort();
+        Meta {
+            mtime_ns: m.mtime_ns,
+            crtime_ns: m.crtime_ns,
+            mode: m.mode,
+            hidden: m.hidden,
+            tags: m.set_tags.then_some(m.tags),
+            xattrs,
+        }
+    }
+}
+
+/// Result of a content upload.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct WriteOutcome {
+    /// The item as the server has it now. On a conflict, the server's own
+    /// version (the client must fetch it).
+    pub item: FfiItem,
+    /// The copy holding the upload, when it conflicted.
+    pub conflict: Option<FfiItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
@@ -278,7 +366,32 @@ pub struct Core {
 const ANCHOR_INDEX: &str = "anchor_index_id";
 const ANCHOR_SEQ: &str = "anchor_seq";
 
+/// An empty file to upload (the system gives no URL for zero-byte files).
+fn tempfile_empty() -> Result<std::fs::File> {
+    let path = std::env::temp_dir().join(format!("homeport-empty-{}", std::process::id()));
+    let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(f)
+}
+
 impl Shared {
+    /// Records an item the server just wrote in the cache (moving it out of
+    /// `old_parent`), so the change feed's report of it is not news.
+    fn store_written(&self, item: Item, old_parent: Option<String>, link_target: Option<String>) -> Result<CachedItem> {
+        let mut link_target = link_target;
+        if let Some(c) = self.cache() {
+            if link_target.is_none()
+                && let Some(old) = c.item(&item.id)?
+            {
+                link_target = old.link_target;
+            }
+            let ci = CachedItem { item, link_target };
+            c.put_item(&ci, old_parent.as_deref())?;
+            return Ok(ci);
+        }
+        Ok(CachedItem { item, link_target })
+    }
+
     fn check_breaker(&self) -> Result<()> {
         let mut t = lock(&self.tripped_at_probe);
         let Some(at) = *t else { return Ok(()) };
@@ -771,6 +884,176 @@ impl Core {
         Arc::new(Subscription { task: Mutex::new(Some(task)) })
     }
 
+    /// Creates a file (content from `content_path`), folder or symlink in
+    /// `parent_id`. `op_id` (the system's template identifier) makes
+    /// retries safe. Fails with `Collision` when the name is taken.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_item(
+        &self,
+        op_id: String,
+        parent_id: String,
+        name: String,
+        kind: ItemKind,
+        content_path: Option<String>,
+        link_target: Option<String>,
+        meta: FfiMeta,
+        may_exist: bool,
+        progress: Option<Arc<dyn ProgressSink>>,
+        cancel: Arc<CancelToken>,
+    ) -> Result<FfiItem> {
+        let mut cancelled = cancel.tx.subscribe();
+        self.run(move |s: Arc<Shared>| async move {
+            s.check_breaker()?;
+            let kind = match kind {
+                ItemKind::File => Kind::File,
+                ItemKind::Dir => Kind::Dir,
+                ItemKind::Symlink => Kind::Symlink,
+                ItemKind::Other => return Err(CoreError::Rejected { msg: "unsupported item kind".into() }),
+            };
+            let target_copy = link_target.clone();
+            let file = match (&content_path, kind) {
+                (Some(p), Kind::File) => Some(std::fs::File::open(p)?),
+                (None, Kind::File) => None,
+                _ => None,
+            };
+            // Small creates go ahead of bulk ones.
+            let size = file.as_ref().map(|f| f.metadata().map(|m| m.len())).transpose()?.unwrap_or(0);
+            let priority = if size < 1 << 20 { Priority::Visible } else { Priority::Background };
+            let report = |n: u64| {
+                if let Some(p) = &progress {
+                    p.progress(n);
+                }
+            };
+            let empty;
+            let file = match file {
+                Some(f) => Some(f),
+                None if kind == Kind::File => {
+                    // An empty file: the system passes no URL for zero bytes.
+                    empty = tempfile_empty()?;
+                    Some(empty)
+                }
+                None => None,
+            };
+            let upload = file.map(|f| homeport_client::Upload { file: f, size, progress: &report });
+            let fut = s.client.create(
+                &op_id,
+                &parent_id,
+                &name,
+                kind,
+                link_target,
+                meta.into(),
+                may_exist,
+                upload,
+                priority,
+            );
+            let r = tokio::select! {
+                r = fut => r.map_err(|e| write_error(&s, e)),
+                _ = cancelled.wait_for(|c| *c) => Err(CoreError::Cancelled),
+            };
+            s.note_result(&r);
+            let item = r?;
+            let c = s.store_written(item, None, target_copy)?;
+            Ok(c.into())
+        })
+        .await
+    }
+
+    /// Replaces a file's content from `content_path`. `base_content_rev`
+    /// is the version the edit started from (`None`: unknown, no check).
+    pub async fn write_content(
+        &self,
+        id: String,
+        base_content_rev: Option<u64>,
+        content_path: String,
+        meta: FfiMeta,
+        progress: Option<Arc<dyn ProgressSink>>,
+        cancel: Arc<CancelToken>,
+    ) -> Result<WriteOutcome> {
+        let mut cancelled = cancel.tx.subscribe();
+        self.run(move |s: Arc<Shared>| async move {
+            s.check_breaker()?;
+            let file = std::fs::File::open(&content_path)?;
+            let size = file.metadata()?.len();
+            let report = |n: u64| {
+                if let Some(p) = &progress {
+                    p.progress(n);
+                }
+            };
+            let upload = homeport_client::Upload { file, size, progress: &report };
+            // An edit someone is waiting on goes ahead of everything else.
+            let priority = if size < 8 << 20 { Priority::UserOpen } else { Priority::Background };
+            let device = device_name();
+            let fut = s.client.write_content(&id, base_content_rev, meta.into(), &device, upload, priority);
+            let r = tokio::select! {
+                r = fut => r.map_err(|e| write_error(&s, e)),
+                _ = cancelled.wait_for(|c| *c) => Err(CoreError::Cancelled),
+            };
+            s.note_result(&r);
+            let (item, conflict) = r?;
+            let item = s.store_written(item, None, None)?;
+            let conflict = conflict.map(|c| s.store_written(c, None, None)).transpose()?;
+            Ok(WriteOutcome { item: item.into(), conflict: conflict.map(Into::into) })
+        })
+        .await
+    }
+
+    /// Renames and/or moves an item and applies metadata.
+    pub async fn modify_item(
+        &self,
+        id: String,
+        new_parent_id: Option<String>,
+        new_name: Option<String>,
+        meta: FfiMeta,
+    ) -> Result<FfiItem> {
+        self.run(move |s: Arc<Shared>| async move {
+            let old_parent = s.cache().and_then(|c| c.item(&id).ok().flatten()).map(|c| c.item.parent_id);
+            let r = s.guarded(async { s.client.modify(&id, new_parent_id, new_name, meta.into()).await.map_err(|e| write_error(&s, e)) }).await;
+            let item = r?;
+            Ok(s.store_written(item, old_parent, None)?.into())
+        })
+        .await
+    }
+
+    /// Moves an item to basebook's Trash. With `listed` it appears in the
+    /// trash container (Finder's Move to Trash); without, it is a delete.
+    pub async fn trash_item(&self, id: String, listed: bool, recursive: bool) -> Result<FfiItem> {
+        self.run(move |s: Arc<Shared>| async move {
+            let old_parent = s.cache().and_then(|c| c.item(&id).ok().flatten()).map(|c| c.item.parent_id);
+            let item = s.guarded(async { s.client.trash(&id, listed, recursive).await.map_err(|e| write_error(&s, e)) }).await?;
+            if listed {
+                Ok(s.store_written(item, old_parent, None)?.into())
+            } else {
+                if let Some(c) = s.cache() {
+                    c.remove_item(&id)?;
+                }
+                Ok(CachedItem { item, link_target: None }.into())
+            }
+        })
+        .await
+    }
+
+    /// Puts a trash container item back as `parent_id/name`.
+    pub async fn untrash_item(&self, id: String, parent_id: String, name: String) -> Result<FfiItem> {
+        self.run(move |s: Arc<Shared>| async move {
+            let item =
+                s.guarded(async { s.client.untrash(&id, &parent_id, &name).await.map_err(|e| write_error(&s, e)) }).await?;
+            Ok(s.store_written(item, Some(proto::TRASH_ID.to_owned()), None)?.into())
+        })
+        .await
+    }
+
+    /// Drops an item from the trash container; it stays in basebook's Trash.
+    pub async fn forget_item(&self, id: String) -> Result<()> {
+        self.run(move |s: Arc<Shared>| async move {
+            s.guarded(async { s.client.forget(&id).await.map_err(|e| write_error(&s, e)) }).await?;
+            if let Some(c) = s.cache() {
+                c.remove_item(&id)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub fn link(&self) -> LinkInfo {
         let s = self.shared.client.link();
         LinkInfo {
@@ -803,6 +1086,12 @@ impl Core {
     }
 }
 
+/// Names never uploaded: Finder metadata and editor temporary files.
+#[uniffi::export]
+pub fn is_junk_name(name: String) -> bool {
+    proto::is_junk(&name)
+}
+
 fn ffi_to_item(i: FfiItem) -> Item {
     Item {
         id: i.id,
@@ -820,5 +1109,22 @@ fn ffi_to_item(i: FfiItem) -> Item {
         mode: i.mode,
         rev: i.rev,
         content_rev: i.content_rev,
+        crtime_ns: i.crtime_ns,
+        flags: i.flags,
+        tags: i.tags,
     }
+}
+
+/// This Mac's short host name ("airbook"), for conflict copy names.
+fn device_name() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for its length.
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+    let name = if ok {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    } else {
+        String::new()
+    };
+    name.split('.').next().unwrap_or_default().to_owned()
 }

@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use homeport_proto::{Item, Kind};
+use homeport_proto::{self as proto, Item, Kind};
 use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA: &str = "
@@ -69,7 +69,8 @@ fn kind_from_i64(k: i64) -> Kind {
     }
 }
 
-const COLS: &str = "id, parent_id, name, kind, size, mtime_ns, ctime_ns, mode, rev, content_rev, link_target";
+const COLS: &str =
+    "id, parent_id, name, kind, size, mtime_ns, ctime_ns, mode, rev, content_rev, link_target, crtime_ns, flags, tags";
 
 fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedItem> {
     Ok(CachedItem {
@@ -84,6 +85,9 @@ fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedItem> {
             mode: r.get::<_, i64>(7)? as u32,
             rev: r.get::<_, i64>(8)? as u64,
             content_rev: r.get::<_, i64>(9)? as u64,
+            crtime_ns: r.get(11)?,
+            flags: r.get::<_, i64>(12)? as u32,
+            tags: r.get(13)?,
         },
         link_target: r.get(10)?,
     })
@@ -91,7 +95,9 @@ fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedItem> {
 
 fn upsert(tx: &Connection, c: &CachedItem) -> rusqlite::Result<()> {
     let i = &c.item;
-    tx.prepare_cached(&format!("INSERT OR REPLACE INTO items ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"))?
+    tx.prepare_cached(&format!(
+        "INSERT OR REPLACE INTO items ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+    ))?
         .execute(params![
             i.id,
             i.parent_id,
@@ -103,7 +109,10 @@ fn upsert(tx: &Connection, c: &CachedItem) -> rusqlite::Result<()> {
             i.mode as i64,
             i.rev as i64,
             i.content_rev as i64,
-            c.link_target
+            c.link_target,
+            i.crtime_ns,
+            i64::from(i.flags),
+            i.tags
         ])?;
     Ok(())
 }
@@ -112,6 +121,17 @@ impl Cache {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
+        // Columns added with protocol 2.
+        let has: bool = db.query_row("SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'crtime_ns'", [], |r| {
+            r.get::<_, i64>(0).map(|n| n > 0)
+        })?;
+        if !has {
+            db.execute_batch(
+                "ALTER TABLE items ADD COLUMN crtime_ns INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE items ADD COLUMN flags INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE items ADD COLUMN tags BLOB;",
+            )?;
+        }
         // Keep the extension small: a modest page cache is plenty.
         db.execute_batch("PRAGMA cache_size = -2048;")?;
         Ok(Self { db })
@@ -199,6 +219,30 @@ impl Cache {
             "SELECT {COLS} FROM items WHERE parent_id IN (SELECT id FROM dirs) ORDER BY id LIMIT ?1 OFFSET ?2"
         ))?;
         st.query_map(params![limit, offset], row_to_item)?.collect()
+    }
+
+    /// Records one item the server just wrote: in its parent's listing if
+    /// that is cached (the trash container always is), else dropped.
+    pub fn put_item(&self, c: &CachedItem, _old_parent: Option<&str>) -> rusqlite::Result<()> {
+        let parent = c.item.parent_id.as_str();
+        if parent == proto::TRASH_ID && self.dir(parent)?.is_none() {
+            // Listed fresh from the server on every enumeration (rev -1).
+            self.db.execute("INSERT OR IGNORE INTO dirs (id, dir_rev, total) VALUES (?1, -1, 0)", [parent])?;
+        }
+        if parent == proto::ROOT_ID || self.dir(parent)?.is_some() {
+            upsert(&self.db, c)
+        } else {
+            self.db.execute("DELETE FROM items WHERE id = ?1", [&c.item.id])?;
+            Ok(())
+        }
+    }
+
+    /// Forgets an item (and a folder's cached listing).
+    pub fn remove_item(&self, id: &str) -> rusqlite::Result<()> {
+        self.db.execute("DELETE FROM items WHERE id = ?1", [id])?;
+        self.db.execute("DELETE FROM items WHERE parent_id = ?1", [id])?;
+        self.db.execute("DELETE FROM dirs WHERE id = ?1", [id])?;
+        Ok(())
     }
 
     /// Replaces a directory's listing.
