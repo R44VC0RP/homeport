@@ -76,8 +76,13 @@ pub async fn run(c: &Client, a: BenchArgs, out: &mut impl Write) -> Result<(), C
 
     let parent = c.resolve_path(&a.under, Priority::Visible).await?;
     let (_, top) = timed_list(c, &parent.id, None).await?;
-    let dirs: Vec<Item> =
+    let mut dirs: Vec<Item> =
         items(&top).iter().filter(|i| i.kind == Kind::Dir && !i.name.starts_with('.')).take(a.dirs).cloned().collect();
+    if dirs.is_empty() {
+        // No subfolders: time listings of `--under` itself.
+        writeln!(out, "note: {:?} has no subfolders; listing it instead", a.under)?;
+        dirs.push(parent.clone());
+    }
 
     let mut first = Stats(Vec::new());
     let mut revs = Vec::new();
@@ -207,7 +212,7 @@ pub async fn run(c: &Client, a: BenchArgs, out: &mut impl Write) -> Result<(), C
         let t = Instant::now();
         c.read_range(&i.id, 0, 4096, false, Priority::UserOpen).await?;
         busy_read.0.push(t.elapsed());
-        let (id, rev) = &revs[busy_list.0.len() % revs.len().max(1)];
+        let (id, rev) = &revs[busy_list.0.len() % revs.len()];
         busy_list.0.push(timed_list(c, id, Some(*rev)).await?.0);
     }
     let _ = tx.send(());
