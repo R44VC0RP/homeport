@@ -1,0 +1,94 @@
+name: Homeport
+options:
+  bundleIdPrefix: dev.vogel.homeport
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 9G68SMNHEU
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Developer ID Application"
+    ENABLE_HARDENED_RUNTIME: YES
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "1"
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    ARCHS: arm64
+    DEAD_CODE_STRIPPING: YES
+    OTHER_CODE_SIGN_FLAGS: "--timestamp=none"
+    # Like the shipped build: no get-task-allow.
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+targets:
+  Homeport:
+    type: application
+    platform: macOS
+    sources:
+      - Homeport
+      - Shared
+      - Generated/Swift
+    dependencies:
+      - target: HomeportFP
+        embed: true
+      - framework: Generated/HomeportFFI.xcframework
+        embed: false
+    info:
+      path: Homeport/Info.plist
+      properties:
+        CFBundleDisplayName: Homeport
+        LSUIElement: true
+        LSApplicationCategoryType: public.app-category.utilities
+        NSHumanReadableCopyright: "© 2026 Ryan Vogel"
+    entitlements:
+      path: Homeport/Homeport.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - 9G68SMNHEU.dev.vogel.homeport
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.vogel.homeport
+        PRODUCT_NAME: Homeport
+  HomeportFP:
+    type: app-extension
+    platform: macOS
+    sources:
+      - HomeportFP
+      - Shared
+      - Generated/Swift
+    dependencies:
+      - framework: Generated/HomeportFFI.xcframework
+        embed: false
+      - sdk: FileProvider.framework
+    info:
+      path: HomeportFP/Info.plist
+      properties:
+        CFBundleDisplayName: Homeport
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+          NSExtensionFileProviderDocumentGroup: 9G68SMNHEU.dev.vogel.homeport
+          NSExtensionFileProviderSupportsEnumeration: true
+          NSExtensionFileProviderDownloadPipelineDepth: 8
+          NSFileProviderDecorations:
+            - Identifier: dev.vogel.homeport.HomeportFP.disconnected
+              BadgeImageType: com.apple.icon-decoration.badge.warning
+              Category: Badge
+              Label: Disconnected
+            - Identifier: dev.vogel.homeport.HomeportFP.disconnectedLabel
+              Category: Sharing
+              Label: Disconnected
+    entitlements:
+      path: HomeportFP/HomeportFP.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        # quinn binds its UDP socket (ephemeral port), which the sandbox
+        # counts as a server socket.
+        com.apple.security.network.server: true
+        com.apple.security.application-groups:
+          - 9G68SMNHEU.dev.vogel.homeport
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.vogel.homeport.HomeportFP
+        PRODUCT_NAME: HomeportFP
+        SKIP_INSTALL: YES
