@@ -1,0 +1,90 @@
+name: Release
+
+# Pushing a tag v* builds homeportd and the homeport CLI for every supported
+# platform and uploads them, with SHA256SUMS, to a draft GitHub Release named
+# after the tag. The maintainer then uploads the notarized Homeport.app
+# (scripts/release-app.sh <tag>) and publishes the draft.
+#
+# Run it by hand (workflow_dispatch) to build the archives as workflow
+# artifacts without creating a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, zig: true }
+          - { os: macos-latest, target: aarch64-apple-darwin, zig: false }
+          - { os: macos-latest, target: x86_64-apple-darwin, zig: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, zig: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.zig
+        uses: mlugg/setup-zig@v2
+      - if: matrix.zig
+        run: pip install cargo-zigbuild
+      - name: Build and package
+        shell: bash
+        run: scripts/package.sh ${{ matrix.target }} ${{ matrix.zig && '--zig' || '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homeport-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum homeport-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Check the tag matches the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml version $version"; exit 1; }
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "Homeport ${TAG#v}" \
+              --notes "Server and CLI archives for every platform are attached. The notarized Homeport.app is uploaded by the maintainer before this draft is published (scripts/release-app.sh)."
+          fi
+          gh release upload "$TAG" --clobber dist/homeport-* dist/SHA256SUMS

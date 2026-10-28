@@ -10,3 +10,4 @@ apple/Homeport/Info.plist
 apple/Homeport/Homeport.entitlements
 apple/HomeportFP/Info.plist
 apple/HomeportFP/HomeportFP.entitlements
+dist/
