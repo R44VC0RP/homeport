@@ -37,11 +37,28 @@ final class FinderWatcher {
     }
 
     func start() {
+        queue.async { Self.logPermission() }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 1, repeating: .milliseconds(400), leeway: .milliseconds(100))
         t.setEventHandler { [weak self] in self?.poll() }
         t.resume()
         timer = t
+    }
+
+    /// Logs whether Homeport may send Apple events to Finder, without asking.
+    private static func logPermission() {
+        let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.finder")
+        guard let desc = target.aeDesc else { return }
+        let status = AEDeterminePermissionToAutomateTarget(desc, typeWildCard, typeWildCard, false)
+        let state: String
+        switch status {
+        case noErr: state = "allowed"
+        case OSStatus(errAEEventNotPermitted): state = "denied (System Settings > Privacy & Security > Automation)"
+        case OSStatus(errAEEventWouldRequireUserConsent): state = "not decided yet (macOS asks the first time Finder is frontmost)"
+        case OSStatus(procNotFound): state = "unknown (Finder not running)"
+        default: state = "status \(status)"
+        }
+        log.notice("Finder automation: \(state, privacy: .public)")
     }
 
     private func poll() {

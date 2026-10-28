@@ -1,4 +1,5 @@
 import FileProvider
+import Network
 import os
 
 let log = Logger(subsystem: "dev.vogel.homeport", category: "fp")
@@ -40,6 +41,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     let manager: NSFileProviderManager?
     let core: Core?
 
+    private let pathMonitor = NWPathMonitor()
+    /// The physical path is neither expensive (cellular, hotspot) nor
+    /// constrained (Low Data Mode).
+    private var pathCheap = false
+    /// Folders whose small files were already requested in this process.
+    private var siblingsRequested: Set<String> = []
+
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
         self.manager = NSFileProviderManager(for: domain)
@@ -57,6 +65,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         }
         self.core = core
         super.init()
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let cheap = path.status == .satisfied && !path.isExpensive && !path.isConstrained
+            self.lock.lock()
+            self.pathCheap = cheap
+            self.lock.unlock()
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "dev.vogel.homeport.path"))
         log.notice("extension started for domain \(domain.identifier.rawValue, privacy: .public)")
     }
 
@@ -122,6 +138,37 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         return progress
     }
 
+    /// Someone opened a file: the small files beside it are the likeliest
+    /// next opens, and each first open costs ~600 ms in fileproviderd on
+    /// macOS 26, so ask the system to download them now (Good, unmetered
+    /// links only; once per folder per process).
+    private func prefetchSiblings(of raw: FfiItem, request: NSFileProviderRequest) {
+        // Downloads that Homeport.app's prefetcher asked for don't count.
+        if request.isSystemRequest || request.requestingExecutable?.path.contains("/Homeport.app/") == true { return }
+        guard let core, let manager else { return }
+        let link = core.link()
+        guard link.probed, link.state == .good else { return }
+        lock.lock()
+        let allowed = pathCheap && siblingsRequested.insert(raw.parentId).inserted
+        lock.unlock()
+        guard allowed, let siblings = try? core.page(dirId: raw.parentId, offset: 0, limit: 2000) else { return }
+        var budget: UInt64 = 4 << 20
+        var ids: [String] = []
+        for s in siblings.sorted(by: { $0.size < $1.size })
+        where s.kind == .file && s.id != raw.id && s.size > 0 && s.size < 256 * 1024 && !s.name.hasPrefix(".") {
+            guard s.size <= budget, ids.count < 48 else { break }
+            budget -= s.size
+            ids.append(s.id)
+        }
+        guard !ids.isEmpty else { return }
+        log.notice("prefetching \(ids.count) small files beside \(raw.id, privacy: .public) (opened by \(request.requestingExecutable?.lastPathComponent ?? "?", privacy: .public))")
+        for id in ids {
+            manager.requestDownloadForItem(withIdentifier: NSFileProviderItemIdentifier(id)) { error in
+                if let error { log.debug("sibling prefetch \(id, privacy: .public): \(String(describing: error), privacy: .public)") }
+            }
+        }
+    }
+
     private func tempURL() throws -> URL {
         guard let manager else { throw NSFileProviderError(.providerNotFound) }
         return try manager.temporaryDirectoryURL().appendingPathComponent(UUID().uuidString)
@@ -148,8 +195,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 raw.size = done.size
                 raw.contentRev = done.contentRev
                 self.noteOutcome(nil)
-                log.notice("fetched \(id, privacy: .public) \(done.bytes) bytes in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+                log.notice("fetched \(id, privacy: .public) \(done.bytes) bytes in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
                 completionHandler(url, Item(raw), nil)
+                self.prefetchSiblings(of: raw, request: request)
             } catch {
                 self.noteOutcome(error)
                 log.error("fetch \(id, privacy: .public) failed after \(Int(Date().timeIntervalSince(started) * 1000)) ms: \(String(describing: error), privacy: .public)")
@@ -226,8 +274,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 let range = len == 0 ? NSRange(location: 0, length: Int(done.size))
                                      : NSRange(location: Int(offset), length: Int(done.bytes))
                 self.noteOutcome(nil)
-                log.notice("fetched \(id, privacy: .public) range \(range.location)+\(range.length) in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+                log.notice("fetched \(id, privacy: .public) range \(range.location)+\(range.length) in \(Int(Date().timeIntervalSince(started) * 1000)) ms for \(request.requestingExecutable?.lastPathComponent ?? "-", privacy: .public) system=\(request.isSystemRequest)")
                 completionHandler(url, Item(raw), range, [], nil)
+                self.prefetchSiblings(of: raw, request: request)
             } catch {
                 self.noteOutcome(error)
                 log.error("partial fetch \(id, privacy: .public) failed: \(String(describing: error), privacy: .public)")
